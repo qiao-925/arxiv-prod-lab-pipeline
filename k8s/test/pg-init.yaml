@@ -1,0 +1,41 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pg-init-test
+  namespace: database
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: psql
+          image: postgres:16.2-alpine
+          env:
+            - name: PGPASSWORD
+              value: "arxiv2024"
+            - name: PGHOST
+              value: postgres.database
+            - name: PGUSER
+              value: postgres
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+
+              # 1) 幂等创建 test 库（PostgreSQL 无 CREATE DATABASE IF NOT EXISTS）
+              psql -d postgres -v ON_ERROR_STOP=1 <<'SQL'
+              SELECT 'CREATE DATABASE arxiv_test'
+              WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'arxiv_test')\gexec
+              SQL
+
+              # 2) 应用「安全」SQL（源自 sql/test/init.sql，经 pg-init-sql-test 挂载）
+              psql -d arxiv_test -v ON_ERROR_STOP=1 -f /sql/init.sql
+          volumeMounts:
+            - name: sql
+              mountPath: /sql
+      volumes:
+        - name: sql
+          configMap:
+            name: pg-init-sql-test

@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# 测试数据
+tests/data/
+data/
+
+# 环境变量
+.env

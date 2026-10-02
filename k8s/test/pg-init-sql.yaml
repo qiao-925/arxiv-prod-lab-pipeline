@@ -1,0 +1,31 @@
+# 本文件由 scripts/gen-sql-configmap.sh 从 sql/test/init.sql 生成，请勿手改。
+# 修改 SQL 请编辑 sql/ 下的源文件后重新生成。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pg-init-sql-test
+  namespace: database
+data:
+  init.sql: |
+    -- ============================================================================
+    -- test 环境初始化 SQL（库：arxiv_test）
+    -- 级别：安全 —— CREATE TABLE IF NOT EXISTS / CREATE INDEX IF NOT EXISTS
+    -- 由 GitOps（k8s/test/pg-init.yaml 的 Job）自动执行，可重复运行。
+    -- ============================================================================
+
+    -- 批次记账表：断点续传与批次审计
+    CREATE TABLE IF NOT EXISTS ingestion_batches (
+        batch_id        UUID PRIMARY KEY,
+        job_name        VARCHAR(50) NOT NULL,
+        source_offset   BIGINT NOT NULL,
+        source_end      BIGINT,
+        record_count    INT DEFAULT 0,
+        status          VARCHAR(20) DEFAULT 'PENDING',
+        checksum        VARCHAR(64),
+        error_message   TEXT,
+        created_at      TIMESTAMP DEFAULT NOW(),
+        committed_at    TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_ingestion_batches_status
+        ON ingestion_batches (job_name, status);
