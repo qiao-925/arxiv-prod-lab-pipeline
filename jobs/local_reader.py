@@ -15,7 +15,8 @@ class LocalReader:
         if not self.path.exists():
             raise FileNotFoundError(
                 f"测试数据不存在: {self.path}\n"
-                f"请先运行: python tests/download_test_2000.py"
+                f"请先运行: python tests/run_test.py"
+                f"（或 python tools/download.py --env test --limit 2000）"
             )
         return "local"
 

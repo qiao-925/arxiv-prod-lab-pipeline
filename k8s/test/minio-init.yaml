@@ -1,0 +1,23 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-init-test
+  namespace: minio
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: minio/mc
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              mc alias set arxiv http://minio.minio:9000 minioadmin minioadmin123
+              # 共享 bucket（逻辑隔离：test 写 arxiv/test/，prod 写 arxiv/prod/）。
+              # S3 前缀是逻辑命名空间，无需显式创建。
+              mc mb --ignore-existing arxiv/arxiv
+              mc ls arxiv/arxiv

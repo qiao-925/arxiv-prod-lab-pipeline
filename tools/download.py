@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from config import HF_DATASET_NAME, HF_ENDPOINT, ENV, DATA_RAW, DATA_RAW_TEST
+from common.config import HF_DATASET_NAME, HF_ENDPOINT, get_data_raw, init_env
 
 # 必须在导入 datasets 之前设置镜像端点
 os.environ.setdefault("HF_ENDPOINT", HF_ENDPOINT)
@@ -145,16 +145,21 @@ def download(output_dir: str, limit: int = 0, force: bool = False):
 
 def main():
     parser = argparse.ArgumentParser(description="从 HuggingFace 下载 arXiv 数据为 JSONL")
-    parser.add_argument("--output", type=str,
-                        default=str(DATA_RAW_TEST if ENV == "test" else DATA_RAW),
-                        help="输出目录（默认按 ENV：test→data/raw_test, prod→data/raw）")
+    parser.add_argument("--env", choices=["test", "prod"], default=None,
+                        help="环境，决定 --output 默认目录（test→data/raw_test, prod→data/raw）")
+    parser.add_argument("--output", type=str, default=None,
+                        help="输出目录（默认按 --env 派生）")
     parser.add_argument("--limit", type=int, default=0,
                         help="下载条数，0 表示全量（默认 0）")
     parser.add_argument("--force", action="store_true",
                         help="忽略缓存标记，强制重新下载")
     args = parser.parse_args()
 
-    download(output_dir=args.output, limit=args.limit, force=args.force)
+    if args.env:
+        init_env(args.env)
+    output = args.output or str(get_data_raw())  # get_data_raw 要求已声明环境
+
+    download(output_dir=output, limit=args.limit, force=args.force)
 
 
 if __name__ == "__main__":

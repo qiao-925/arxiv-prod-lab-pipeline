@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""run_test.py - 端到端测试
+"""run_test.py - 端到端测试（test 环境）
 
 流程：
     1. 下载 2000 条论文     → data/raw_test
     2. 预处理为分区 Parquet  → data/sorted_test
-    3. （可选）接入 Kafka / PG
+    3. （可选）接入 Kafka / PG（Topic: arxiv-papers-test，库: arxiv_test）
 
 用法：
     python tests/run_test.py                 # 1 + 2
     python tests/run_test.py --with-ingest   # 1 + 2 + 3（需 Kafka/PG 可用）
 
-以子进程调用各 CLI 入口，等价于手工逐条执行，验证真实运行路径。
+入口**显式** init_env("test")；对子进程透传 --env test，
+保证测试永远落在 test 资源上，绝不会静默跑到 prod。
 """
 import argparse
 import subprocess
@@ -19,6 +20,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PY = sys.executable
+
+sys.path.insert(0, str(ROOT))
+from common.config import init_env
 
 
 def run(cmd):
@@ -34,26 +38,30 @@ def main():
                         help="下载条数（默认 2000）")
     args = parser.parse_args()
 
+    # 显式声明环境（未声明时任何 get_xxx() 都会报错）
+    init_env("test")
+
     print("\n" + "=" * 70)
     print(f"端到端测试（{args.limit} 条）")
     print("=" * 70)
 
-    # 1. 下载
+    # 1. 下载 → data/raw_test
     run([PY, "tools/download.py",
-         "--output", "data/raw_test",
+         "--env", "test",
          "--limit", str(args.limit)])
 
-    # 2. 预处理（小资源）
+    # 2. 预处理（小资源）→ data/sorted_test
     run([PY, "tools/preprocess.py",
-         "--input", "data/raw_test",
-         "--output", "data/sorted_test",
+         "--env", "test",
          "--driver-memory", "2g",
          "--executor-memory", "4g",
          "--shuffle-partitions", "8"])
 
-    # 3. 可选：接入
+    # 3. 可选：接入（test 资源）
     if args.with_ingest:
-        run([PY, "jobs/ingest_to_kafka.py", "--run-limit", "1000"])
+        run([PY, "jobs/ingest_to_kafka.py",
+             "--env", "test",
+             "--run-limit", "1000"])
 
     print("\n" + "=" * 70)
     print("端到端测试完成")

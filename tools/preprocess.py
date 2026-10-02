@@ -21,7 +21,7 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from config import ENV, DATA_RAW, DATA_RAW_TEST, DATA_SORTED, DATA_SORTED_TEST
+from common.config import get_data_raw, get_data_sorted, init_env
 
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, from_json, udf
@@ -230,12 +230,12 @@ def preprocess(
 
 def main():
     parser = argparse.ArgumentParser(description="JSONL → 按发布日期分区 Parquet")
-    parser.add_argument("--input", type=str,
-                        default=str(DATA_RAW_TEST if ENV == "test" else DATA_RAW),
-                        help="输入文件或目录（默认按 ENV：test→data/raw_test, prod→data/raw）")
-    parser.add_argument("--output", type=str,
-                        default=str(DATA_SORTED_TEST if ENV == "test" else DATA_SORTED),
-                        help="输出目录（默认按 ENV：test→data/sorted_test, prod→data/sorted）")
+    parser.add_argument("--env", choices=["test", "prod"], default=None,
+                        help="环境，决定 --input/--output 默认目录")
+    parser.add_argument("--input", type=str, default=None,
+                        help="输入文件或目录（默认按 --env：test→data/raw_test, prod→data/raw）")
+    parser.add_argument("--output", type=str, default=None,
+                        help="输出目录（默认按 --env：test→data/sorted_test, prod→data/sorted）")
     parser.add_argument("--pattern", type=str, default="*.jsonl",
                         help="目录模式下匹配输入文件（默认 *.jsonl）")
     parser.add_argument("--driver-memory", type=str, default="4g",
@@ -248,9 +248,14 @@ def main():
                         help="忽略 _completed 标记，强制重跑")
     args = parser.parse_args()
 
+    if args.env:
+        init_env(args.env)
+    input_path = args.input or str(get_data_raw())      # get_data_raw 要求已声明环境
+    output_path = args.output or str(get_data_sorted())
+
     preprocess(
-        input_path=args.input,
-        output_path=args.output,
+        input_path=input_path,
+        output_path=output_path,
         pattern=args.pattern,
         driver_memory=args.driver_memory,
         executor_memory=args.executor_memory,

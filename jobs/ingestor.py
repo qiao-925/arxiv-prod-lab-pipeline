@@ -6,10 +6,11 @@ import time
 import uuid
 from datetime import datetime
 
+from common.kafka import KafkaClient
+from common.logger import setup_logger
+
 from .config import Config
-from .logger import setup_logger
 from .pg_client import PGClient
-from .kafka_client import KafkaClient
 
 if Config.DATA_SOURCE == "local":
     from .local_reader import LocalReader as Reader
@@ -46,7 +47,7 @@ class Ingestor:
         self.log.info(f"⚠️  当前环境:    {Config.ENV}")
         self.log.info(f"⚠️  Kafka Topic: {Config.KAFKA_TOPIC}")
         self.log.info(f"⚠️  PG Database: {Config.PG_DB}")
-        self.log.info(f"⚠️  MinIO Bucket:{Config.MINIO_BUCKET}")
+        self.log.info(f"⚠️  MinIO:       {Config.MINIO_BUCKET}/{Config.MINIO_PREFIX}")
         self.log.info(f"⚠️  Job Name:    {Config.JOB_NAME}")
         self.log.info("=" * 60)
         if Config.CONFIRM_STARTUP:
