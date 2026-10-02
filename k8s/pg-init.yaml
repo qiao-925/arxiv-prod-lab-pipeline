@@ -1,0 +1,54 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pg-init-schema
+  namespace: database
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: psql
+          image: postgres:16.2-alpine
+          env:
+            - name: PGPASSWORD
+              value: "arxiv2024"
+            - name: PGHOST
+              value: postgres.database
+            - name: PGUSER
+              value: postgres
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+
+              # 1) 幂等创建两个库（test→arxiv_dev / prod→arxiv_prod）
+              #    PostgreSQL 无 CREATE DATABASE IF NOT EXISTS，用 \gexec 条件执行
+              psql -d postgres -v ON_ERROR_STOP=1 <<'SQL'
+              SELECT 'CREATE DATABASE arxiv_dev'
+              WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'arxiv_dev')\gexec
+              SELECT 'CREATE DATABASE arxiv_prod'
+              WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'arxiv_prod')\gexec
+              SQL
+
+              # 2) 两库建同一套表结构（逻辑隔离：表结构相同，靠库名区分环境）
+              DDL="CREATE TABLE IF NOT EXISTS ingestion_batches (
+                  batch_id        UUID PRIMARY KEY,
+                  job_name        VARCHAR(50) NOT NULL,
+                  source_offset   BIGINT NOT NULL,
+                  source_end      BIGINT,
+                  record_count    INT DEFAULT 0,
+                  status          VARCHAR(20) DEFAULT 'PENDING',
+                  checksum        VARCHAR(64),
+                  error_message   TEXT,
+                  created_at      TIMESTAMP DEFAULT NOW(),
+                  committed_at    TIMESTAMP
+              );
+              CREATE INDEX IF NOT EXISTS idx_ingestion_batches_status
+              ON ingestion_batches (job_name, status);"
+
+              for db in arxiv_dev arxiv_prod; do
+                echo "初始化 ${db} ..."
+                psql -d "$db" -v ON_ERROR_STOP=1 -c "$DDL"
+              done
