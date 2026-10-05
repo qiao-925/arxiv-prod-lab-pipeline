@@ -1,6 +1,7 @@
 """jobs - 业务 Job 包（数据接入的完整实现）
 
-模块平铺在本目录（不搞深层嵌套）：入口 `ingest_to_kafka.py`，其余为
-被它引用的业务模块（config / ingestor / pg_client / hf_reader / local_reader）。
-连接端点与 Kafka 客户端来自 common，本包只含业务语义。
+模块平铺在本目录：
+    config.py            配置（import 顺序敏感，保持独立）
+    readers.py           数据读取（HF + Local）
+    job_scan_push_kafka.py   入口 + 主流程 + PG 记账
 """

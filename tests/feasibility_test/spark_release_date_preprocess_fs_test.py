@@ -19,7 +19,7 @@ from pyspark.sql.types import (
 )
 
 
-DEFAULT_INPUT = "/home/qiao/arxiv-prod-lab-pipeline/tests/data/test_2000.jsonl"
+DEFAULT_INPUT = "/home/qiao/arxiv-prod-lab-pipeline//data/raw_test/test_2000.jsonl"
 DEFAULT_OUTPUT = "/home/qiao/arxiv-prod-lab-pipeline/tests/data/sorted"
 
 
