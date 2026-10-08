@@ -1,0 +1,33 @@
+[project]
+name = "arxiv-prod-lab-pipeline"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "qiao", email = "noneplus@sina.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "common>=0.1.2",
+    "datasets>=2.20.0",
+    "hf-transfer>=0.1.9",
+    "infisicalsdk>=1.0.17",
+    "kafka-python>=2.0.2",
+    "minio>=7.2.20",
+    "psycopg2-binary>=2.9.9",
+    "pyspark>=3.5.0",
+    "pytest>=9.1.1",
+    "python-dotenv>=1.2.4",
+    "requests>=2.34.2",
+]
+
+[project.scripts]
+arxiv-prod-lab-pipeline = "arxiv_prod_lab_pipeline:main"
+
+[[tool.uv.index]]
+url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
+default = true
+
+[build-system]
+requires = ["uv_build>=0.12.22,<0.13.0"]
+build-backend = "uv_build"

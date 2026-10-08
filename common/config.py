@@ -12,7 +12,7 @@
 import os
 import typing
 from pathlib import Path
-
+from infisical_sdk import InfisicalSDKClient
 from dotenv import load_dotenv
 
 # ⚠️ 必须在任何 os.getenv 之前执行（只读 .env，无副作用）
@@ -78,7 +78,6 @@ def _load() -> None:
     if env not in _VALID_ENVS:
         raise ValueError(f"ENV 必须是 {_VALID_ENVS}，当前: {env!r}")
 
-    from infisical_sdk import InfisicalSDKClient
 
     client = InfisicalSDKClient(
         host=_optional("INFISICAL_HOST", "https://app.infisical.com"),

@@ -66,3 +66,12 @@ data/       原始 JSONL + 分区 Parquet
 ## 依赖
 
 `kafka-python` `psycopg2-binary` `pyarrow` `pyspark` `datasets` `python-dotenv` `infisical-sdk`
+
+## huggingface 数据集下载
+
+```angular2html
+uvx hf download ines-besrour/unarxive_2024 --repo-type=dataset
+
+uvx hf cache verify ines-besrour/unarxive_2024 --repo-type=dataset
+
+```
