@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: arxiv-app
+  namespace: arxiv
+  labels:
+    app: arxiv-app
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: arxiv-app
+  template:
+    metadata:
+      labels:
+        app: arxiv-app
+    spec:
+      restartPolicy: Always
+      containers:
+        - name: app
+          image: qiao925/arxiv-pipeline:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: ENV
+              value: prod
+            - name: INFISICAL_CLIENT_ID
+              valueFrom:
+                secretKeyRef: {name: infisical, key: client_id}
+            - name: INFISICAL_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef: {name: infisical, key: client_secret}
+            - name: INFISICAL_PROJECT_ID
+              valueFrom:
+                secretKeyRef: {name: infisical, key: project_id}
+          resources:
+            requests: {memory: "512Mi", cpu: "250m"}
+            limits: {memory: "2Gi", cpu: "1"}
