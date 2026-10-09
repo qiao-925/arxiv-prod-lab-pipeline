@@ -3,6 +3,7 @@
 .venv/
 __pycache__/
 *.pyc
+*.pyo
 .pytest_cache/
 .env
 .env.*
@@ -12,3 +13,5 @@ tests/
 k8s/
 .github/
 README.md
+*.md
+.DS_Store
