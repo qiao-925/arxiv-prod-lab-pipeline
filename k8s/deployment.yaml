@@ -20,7 +20,7 @@ spec:
       restartPolicy: Always
       containers:
         - name: app
-          image: peterlocal/arxiv-prod-lab-pipeline:latest
+          image: peterlocal/arxiv-prod-lab-pipeline:b337ca4
           imagePullPolicy: IfNotPresent
           env:
             - name: ENV
