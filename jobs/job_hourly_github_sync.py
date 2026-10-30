@@ -67,7 +67,7 @@ def ensure_table(pg):
     pg.execute("""
         CREATE TABLE IF NOT EXISTS job_hourly_github_sync_p0_task (
             task_date DATE PRIMARY KEY,
-            status VARCHAR(20) NOT NULL DEFAULT 'pending',
+            status VARCHAR(20) NOT NULL DEFAULT 'running',
             created_at TIMESTAMP DEFAULT NOW(),
             updated_at TIMESTAMP DEFAULT NOW()
         )
@@ -92,7 +92,7 @@ def ensure_table(pg):
             scan_start DATE NOT NULL,
             scan_to DATE NOT NULL,
             progress JSONB NOT NULL DEFAULT '{}'::jsonb,
-            status VARCHAR(20) NOT NULL DEFAULT 'pending',
+            status VARCHAR(20) NOT NULL DEFAULT 'running',
             try_number INT NOT NULL DEFAULT 0,
             error_msg TEXT,
             created_at TIMESTAMP DEFAULT NOW(),
@@ -103,7 +103,7 @@ def ensure_table(pg):
     pg.execute("""
         CREATE INDEX IF NOT EXISTS idx_repo_task_pending
         ON job_hourly_github_sync_repo_task(lane, task_date, round_number, status, id)
-        WHERE status IN ('pending', 'running', 'paused')
+        WHERE status IN ('running', 'failed')
     """)
     pg.execute("""
         CREATE INDEX IF NOT EXISTS idx_repo_task_done
@@ -120,14 +120,6 @@ def ensure_baseline(pg):
     """, (BASELINE_DATE,))
 
 
-def reset_stale(pg):
-    pg.execute("""
-        UPDATE job_hourly_github_sync_repo_task
-        SET status = 'pending', updated_at = NOW()
-        WHERE status = 'running'
-          AND updated_at < NOW() - INTERVAL '2 hours'
-    """)
-
 
 # ═══════════════════════════════════════════════════════════════════════
 # P0 锚点操作
@@ -135,7 +127,7 @@ def reset_stale(pg):
 def current_p0_date(pg, target):
     row = pg.fetch_one("""
         SELECT task_date FROM job_hourly_github_sync_p0_task
-        WHERE status = 'paused' ORDER BY task_date LIMIT 1
+        WHERE status = 'running' ORDER BY task_date LIMIT 1
     """)
     if row:
         return row[0]
@@ -189,17 +181,16 @@ def mark_p2_completed(pg, round_number):
 # repo_task 明细操作
 # ═══════════════════════════════════════════════════════════════════════
 def pick_one(pg, lane, task_date, round_number):
+    """running + failed 都取，按 try_number 升序（先处理新失败的）。"""
     return pg.fetch_one("""
         SELECT id, repo_id, full_name, scan_start, scan_to, progress, status
         FROM job_hourly_github_sync_repo_task
         WHERE lane = %s AND task_date = %s AND round_number = %s
-          AND status IN ('pending', 'running', 'paused')
-        ORDER BY id LIMIT 1
+          AND status IN ('running', 'failed')
+        ORDER BY try_number, id LIMIT 1
     """, (lane, task_date, round_number))
 
 
-def mark_sub_running(pg, sub_id):
-    pg.execute("UPDATE job_hourly_github_sync_repo_task SET status='running', updated_at=NOW() WHERE id=%s", (sub_id,))
 
 
 def save_progress(pg, sub_id, progress):
@@ -213,22 +204,26 @@ def mark_sub_completed(pg, sub_id):
     pg.execute("UPDATE job_hourly_github_sync_repo_task SET status='completed', updated_at=NOW() WHERE id=%s", (sub_id,))
 
 
-def mark_sub_paused(pg, sub_id):
-    pg.execute("UPDATE job_hourly_github_sync_repo_task SET status='paused', updated_at=NOW() WHERE id=%s", (sub_id,))
 
 
-def mark_sub_inactive(pg, sub_id, reason):
-    pg.execute(
-        "UPDATE job_hourly_github_sync_repo_task SET status='inactive', error_msg=%s, updated_at=NOW() WHERE id=%s",
-        (reason[:500], sub_id),
-    )
+def mark_sub_failed(pg, sub_id, reason):
+    """确定性失败（404 等），下次 pick 仍会重试。"""
+    pg.execute("""
+        UPDATE job_hourly_github_sync_repo_task
+        SET status = 'failed',
+            try_number = try_number + 1,
+            error_msg = %s,
+            updated_at = NOW()
+        WHERE id = %s
+    """, (reason[:500], sub_id))
 
 
 def fail_sub(pg, sub_id, error):
+    """瞬时错误：< 3 保持 running，>= 3 标 failed（下次仍重试）。"""
     pg.execute("""
         UPDATE job_hourly_github_sync_repo_task
         SET try_number = try_number + 1,
-            status = CASE WHEN try_number + 1 >= %s THEN 'failed' ELSE 'pending' END,
+            status = CASE WHEN try_number + 1 >= %s THEN 'failed' ELSE 'running' END,
             error_msg = %s, updated_at = NOW()
         WHERE id = %s
     """, (MAX_TRIES, (error or "")[:500], sub_id))
@@ -407,7 +402,7 @@ def _process_star(pg, cli, sub_id, repo_id, full_name, scan_start, scan_to, prog
         try:
             payload = cli.fetch_page(full_name, page)
         except NotFoundError:
-            mark_sub_inactive(pg, sub_id, f"star 404: {full_name}")
+            mark_sub_failed(pg, sub_id, f"404: star {full_name}")
             raise SubTaskDone
         more = star_has_more(payload, scan_start)
         if more and page >= MAX_PAGES:
@@ -431,7 +426,7 @@ def _process_graphql(pg, cli, sub_id, repo_id, full_name, scan_start, scan_to, m
         data, _ = cli.execute(build_graphql_query(full_name, metric, cursor))
         repo_data = data.get("repository")
         if repo_data is None:
-            mark_sub_inactive(pg, sub_id, f"{metric}: repo missing")
+            mark_sub_failed(pg, sub_id, f"404: {metric} repo missing")
             raise SubTaskDone
         conn = repo_data.get(metric)
         if conn is None:
@@ -458,7 +453,6 @@ def _process_graphql(pg, cli, sub_id, repo_id, full_name, scan_start, scan_to, m
 
 def process_repo(pg, star_cli, gql_cli, sub):
     sub_id, repo_id, full_name, scan_start, scan_to, progress, _ = sub
-    mark_sub_running(pg, sub_id)
     try:
         for metric in METRICS:
             if _pget(progress, metric).get("done"):
@@ -470,7 +464,7 @@ def process_repo(pg, star_cli, gql_cli, sub):
     except SubTaskDone:
         return
     except (RestPause, GraphQLPause):
-        mark_sub_paused(pg, sub_id)
+        # 限流保持 running，不增 try_number
         raise
     except AuthError:
         raise
@@ -510,7 +504,7 @@ def ensure_p0_subtasks(pg, task_date, limit):
           )
           AND NOT EXISTS (
             SELECT 1 FROM job_hourly_github_sync_repo_task s
-            WHERE s.repo_id = f.repo_id AND s.status = 'inactive'
+            WHERE s.repo_id = f.repo_id AND s.status = 'failed'
               AND s.task_date >= %(task_date)s - %(inactive_retry)s
           )
         ORDER BY f.created DESC NULLS LAST, f.repo_id
@@ -544,7 +538,7 @@ def ensure_p2_subtasks(pg, round_number, snapshot_at, limit):
           )
           AND NOT EXISTS (
             SELECT 1 FROM job_hourly_github_sync_repo_task s
-            WHERE s.repo_id = f.repo_id AND s.status = 'inactive'
+            WHERE s.repo_id = f.repo_id AND s.status = 'failed'
               AND s.task_date >= %(snapshot_date)s - %(inactive_retry)s
           )
         ORDER BY COALESCE(f.last_scan_to, '1970-01-01'::date) ASC, f.created DESC NULLS LAST
@@ -576,8 +570,7 @@ def run_p0(pg, star_cli, gql_cli, target, log):
             try:
                 process_repo(pg, star_cli, gql_cli, sub)
             except (RestPause, GraphQLPause):
-                log.warning(f"P0 {task_date} paused")
-                mark_p0(pg, task_date, "paused")
+                log.warning(f"P0 {task_date} 限流，保持 running")
                 return False
         mark_p0(pg, task_date, "completed")
         log.info(f"✅ P0 {task_date} completed")
@@ -615,7 +608,6 @@ def run(env, log):
     try:
         ensure_table(pg)
         ensure_baseline(pg)
-        reset_stale(pg)
         target = utc_yesterday()
         star_cli = StarClient(_token())
         gql_cli = GraphQLClient(_token())

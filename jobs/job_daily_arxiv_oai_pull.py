@@ -254,29 +254,43 @@ def ensure_initial_record(pg: PGClient, job_name: str, init_date: str) -> None:
     pg.execute("""
                INSERT INTO arxiv_oai_pull_log
                    (job_name, pull_date, status, record_count, started_at, committed_at)
-               VALUES (%s, %s, 'COMMITTED', 0, NOW(), NOW()) ON CONFLICT (job_name, pull_date) DO NOTHING
+               VALUES (%s, %s, 'completed', 0, NOW(), NOW()) ON CONFLICT (job_name, pull_date) DO NOTHING
                """, (job_name, init_date))
 
 
-def query_last_committed(pg: PGClient, job_name: str) -> str:
-    row = pg.fetch_one("""
-                       SELECT MAX(pull_date)
-                       FROM arxiv_oai_pull_log
-                       WHERE job_name = %s
-                         AND status = 'COMMITTED'
-                       """, (job_name,))
+def next_pull_date(pg: PGClient, job_name: str, target: str) -> Optional[str]:
+    """优先级：running > failed > completed+1；追上 target 返回 None。"""
+    row = pg.fetch_one(
+        "SELECT pull_date FROM arxiv_oai_pull_log "
+        "WHERE job_name = %s AND status = 'running' ORDER BY pull_date LIMIT 1",
+        (job_name,))
+    if row is not None:
+        return str(row[0])
+    row = pg.fetch_one(
+        "SELECT pull_date FROM arxiv_oai_pull_log "
+        "WHERE job_name = %s AND status = 'failed' ORDER BY pull_date LIMIT 1",
+        (job_name,))
+    if row is not None:
+        return str(row[0])
+    row = pg.fetch_one(
+        "SELECT MAX(pull_date) FROM arxiv_oai_pull_log "
+        "WHERE job_name = %s AND status = 'completed'", (job_name,))
     if row is None or row[0] is None:
-        raise RuntimeError(f"arxiv_oai_pull_log 中无 {job_name} 的 COMMITTED 记录")
-    return str(row[0])
+        return None
+    nxt = row[0] + timedelta(days=1)
+    if nxt > date.fromisoformat(target):
+        return None
+    return nxt.isoformat()
 
 
-def mark_committed(pg: PGClient, job_name: str, pull_date: str, n: int) -> None:
+
+def mark_completed(pg: PGClient, job_name: str, pull_date: str, n: int) -> None:
     pg.execute("""
                INSERT INTO arxiv_oai_pull_log
                    (job_name, pull_date, status, record_count, committed_at)
-               VALUES (%s, %s, 'COMMITTED', %s, NOW()) ON CONFLICT (job_name, pull_date) DO
+               VALUES (%s, %s, 'completed', %s, NOW()) ON CONFLICT (job_name, pull_date) DO
                UPDATE
-                   SET status = 'COMMITTED',
+                   SET status = 'completed',
                    record_count = EXCLUDED.record_count,
                    committed_at = NOW(),
                    error_message = NULL
@@ -287,9 +301,9 @@ def mark_failed(pg: PGClient, job_name: str, pull_date: str, error: str) -> None
     pg.execute("""
                INSERT INTO arxiv_oai_pull_log
                    (job_name, pull_date, status, error_message, started_at)
-               VALUES (%s, %s, 'FAILED', %s, NOW()) ON CONFLICT (job_name, pull_date) DO
+               VALUES (%s, %s, 'failed', %s, NOW()) ON CONFLICT (job_name, pull_date) DO
                UPDATE
-                   SET status = 'FAILED', error_message = EXCLUDED.error_message
+                   SET status = 'failed', error_message = EXCLUDED.error_message
                """, (job_name, pull_date, error[:500]))
 
 
@@ -416,43 +430,40 @@ def run(env: str, log) -> None:
         ensure_tables(pg)
         ensure_initial_record(pg, job_name, DEFAULT_INIT_DATE)
 
-        last = query_last_committed(pg, job_name)
-        log.info(f"上次已提交: {last}")
-
-        if last >= target_date:
-            log.info("✅ 已追上 target，退出")
-            return
-
         client = MinIOClient(log)
         on_page = make_on_page(client, pg)
 
-        current = date.fromisoformat(last)
-        target = date.fromisoformat(target_date)
+        while True:
+            next_day = next_pull_date(pg, job_name, target_date)
+            if next_day is None:
+                log.info("✅ 已追上 target，退出")
+                return
 
-        while current < target:
-            next_day = (current + timedelta(days=1)).isoformat()
             log.info(f"===== 拉取 {next_day} =====")
+            pg.execute("""
+                INSERT INTO arxiv_oai_pull_log (job_name, pull_date, status, started_at)
+                VALUES (%s, %s, 'running', NOW())
+                ON CONFLICT (job_name, pull_date) DO UPDATE
+                SET status = 'running', started_at = NOW(), error_message = NULL
+            """, (job_name, next_day))
 
             t0 = time.time()
             try:
                 stats = harvest(next_day, next_day, on_page=on_page, log=log)
-                mark_committed(pg, job_name, next_day, stats["written"])
+                mark_completed(pg, job_name, next_day, stats["written"])
                 log.info(f"✅ {next_day} 完成：{stats}")
             except Exception as e:
                 log.error(f"❌ {next_day} 失败：{e}")
                 mark_failed(pg, job_name, next_day, str(e))
-                raise
+                return
 
             elapsed = time.time() - t0
             wait = max(0.0, RATE_LIMIT_SECONDS - elapsed)
             if wait > 0:
                 time.sleep(wait)
-
-            current = date.fromisoformat(next_day)
-
-        log.info("✅ 所有日期已推进完成")
     finally:
         pg.close()
+
 
 
 def main() -> int:
