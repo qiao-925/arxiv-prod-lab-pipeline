@@ -3,13 +3,14 @@
 
 对齐新 Job API：
     harvest(from_date, until_date, *, on_page, log)
-    make_minio_on_page(client)
-    ensure_table / ensure_initial_record / query_last_committed / mark_*
+    make_on_page(client, pg)   # 支持双写 MinIO + PG
+    ensure_tables / ensure_initial_record / query_last_committed / mark_*
+    write_to_pg
 
 运行：
     uv run pytest tests/test_job_daily_arxiv_oai_pull.py -v
 """
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import requests
@@ -17,15 +18,16 @@ import requests
 from jobs.job_daily_arxiv_oai_pull import (
     NS,
     ensure_initial_record,
-    ensure_table,
+    ensure_tables,
     extract_published_date,
     harvest,
-    make_minio_on_page,
+    make_on_page,
     mark_committed,
     mark_failed,
     parse_arxiv_date,
     parse_record,
     query_last_committed,
+    write_to_pg,
 )
 
 
@@ -34,13 +36,13 @@ from jobs.job_daily_arxiv_oai_pull import (
 # ═══════════════════════════════════════════════════════════════════════
 
 def _record_fragment(
-    arxiv_id: str,
-    v1_date: str,
-    *,
-    deleted: bool = False,
-    has_metadata: bool = True,
-    has_versions: bool = True,
-    extra_versions: list | None = None,
+        arxiv_id: str,
+        v1_date: str,
+        *,
+        deleted: bool = False,
+        has_metadata: bool = True,
+        has_versions: bool = True,
+        extra_versions: list | None = None,
 ) -> str:
     """构造 <record> 片段（不含 XML 声明和 OAI-PMH 根）。"""
     if deleted:
@@ -125,6 +127,7 @@ def _collect_on_page(kept: list):
     def on_page(records):
         kept.extend(records)
         return len(records)
+
     return on_page
 
 
@@ -235,19 +238,6 @@ def test_parse_record_multi_versions_ordered():
 # ═══════════════════════════════════════════════════════════════════════
 # 4. harvest：主流程
 # ═══════════════════════════════════════════════════════════════════════
-
-def _harvest_with_mock(xml_pages, on_page, monkeypatch):
-    """注入 mock session，跳过 sleep。"""
-    import jobs.job_daily_arxiv_oai_pull as job_mod
-    monkeypatch.setattr(job_mod.time, "sleep", lambda s: None)
-
-    session = _mock_session(*xml_pages)
-    return harvest(
-        "2024-10-01", "2024-10-01",
-        on_page=on_page,
-        log=MagicMock(),
-    ) if False else _harvest_with_session(session, on_page, monkeypatch)
-
 
 def _harvest_with_session(session, on_page, monkeypatch):
     """harvest 当前不接收 session 参数，改用 monkeypatch 替换 requests.Session。"""
@@ -437,48 +427,136 @@ def test_harvest_oai_error_code(monkeypatch):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 7. on_page：make_minio_on_page
+# 7. 双写逻辑：make_on_page & write_to_pg
 # ═══════════════════════════════════════════════════════════════════════
 
-def test_minio_on_page_groups_by_published_month():
+@patch("jobs.job_daily_arxiv_oai_pull.write_to_pg")
+def test_make_on_page_dual_write(mock_write_to_pg):
+    """验证 on_page 同时写 MinIO 和 PG。"""
     mock_client = MagicMock()
     mock_client.upsert_jsonl.return_value = 1
+    mock_pg = MagicMock()
 
-    on_page = make_minio_on_page(mock_client)
+    on_page = make_on_page(mock_client, mock_pg)
+
     records = [
         {"arxiv_id": "0001.00001", "published_date_iso": "2023-10-02T00:11:47+00:00"},
-        {"arxiv_id": "0001.00002", "published_date_iso": "2023-10-15T00:11:47+00:00"},
-        {"arxiv_id": "0001.00003", "published_date_iso": "2023-11-01T00:11:47+00:00"},
+        {"arxiv_id": "0001.00002", "published_date_iso": "2023-11-01T00:11:47+00:00"},
     ]
-    on_page(records)
 
+    # 执行
+    total = on_page(records)
+
+    # 1. 验证 MinIO 调用
     assert mock_client.upsert_jsonl.call_count == 2
     object_names = [c[0][0] for c in mock_client.upsert_jsonl.call_args_list]
     assert "papers/arxiv_oai/published_year=2023/month=10/state.jsonl" in object_names
     assert "papers/arxiv_oai/published_year=2023/month=11/state.jsonl" in object_names
+    assert total == 2
+
+    # 2. 验证 PG 调用：使用 mock 替代真实的 SQL 执行
+    mock_write_to_pg.assert_called_once_with(mock_pg, records)
 
 
-def test_minio_on_page_skips_invalid_iso():
-    """published_date_iso 长度不足 7 → 跳过。"""
+@patch("jobs.job_daily_arxiv_oai_pull.write_to_pg")
+def test_make_on_page_skips_invalid_iso_for_minio(mock_write_to_pg):
+    """验证对于无效的 published_date_iso，不会写入 MinIO（但仍会尝试写 PG）。"""
     mock_client = MagicMock()
-    on_page = make_minio_on_page(mock_client)
-    on_page([
+    mock_pg = MagicMock()
+    on_page = make_on_page(mock_client, mock_pg)
+
+    records = [
         {"arxiv_id": "x", "published_date_iso": ""},
         {"arxiv_id": "y", "published_date_iso": "2023"},
-    ])
+    ]
+
+    on_page(records)
+
+    # MinIO 不应写入
     mock_client.upsert_jsonl.assert_not_called()
+
+    # PG 仍会被调用（由数据库去处理 NULL）
+    mock_write_to_pg.assert_called_once_with(mock_pg, records)
+
+
+@patch("jobs.job_daily_arxiv_oai_pull.execute_values")
+def test_write_to_pg(mock_execute_values):
+    """验证 PG 写入时的 SQL 拼接、UPSERT 和 JSON 序列化。"""
+    mock_pg = MagicMock()
+
+    records = [{
+        "arxiv_id": "2310.00826",
+        "title": "T1",
+        "abstract": "A1",
+        "authors": "A, B",
+        "categories": "cs.LG",
+        "set_specs": ["cs.LG"],
+        "submitter": "Sub",
+        "comments": "None",
+        "journal_ref": None,
+        "doi": None,
+        "report_no": None,
+        "license": None,
+        "versions": [{"version": "v1", "date": "2023-10-02"}],
+        "published_date_iso": "2023-10-02T00:11:47+00:00",
+        "datestamp": "2026-10-06",
+        "oai_identifier": "oai:arXiv.org:2310.00826"
+    }]
+
+    write_to_pg(mock_pg, records)
+
+    # 验证 pg.cursor() 被调用
+    assert mock_pg.cursor.called
+
+    # 验证 execute_values 被调用
+    mock_execute_values.assert_called_once()
+
+    # 获取 execute_values 的入参
+    call_args = mock_execute_values.call_args[0]
+    cur = call_args[0]
+    sql = call_args[1]
+    rows = call_args[2]
+
+    # 验证 SQL
+    assert "INSERT INTO arxiv_papers" in sql
+    assert "ON CONFLICT (arxiv_id) DO UPDATE" in sql
+    assert "arxiv_id = EXCLUDED.arxiv_id" not in sql  # 主键不应在 UPDATE 中
+
+    # 验证数据
+    assert len(rows) == 1
+    row = rows[0]
+    assert row[0] == "2310.00826"
+    assert row[5] == '["cs.LG"]'  # set_specs 被转为 JSON
+    assert row[12] == '[{"version": "v1", "date": "2023-10-02"}]'  # versions 被转为 JSON
+    assert row[13] == "2023-10-02T00:11:47+00:00"
+
+
+def test_write_to_pg_empty():
+    """空列表不应触发 SQL 执行。"""
+    mock_pg = MagicMock()
+    write_to_pg(mock_pg, [])
+    mock_pg.cursor.assert_not_called()
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # 8. PG 记账函数（mock pg）
 # ═══════════════════════════════════════════════════════════════════════
 
-def test_ensure_table_calls_ddl():
+def test_ensure_tables_calls_ddl():
+    """验证建表语句包含了账本表和业务目标表。"""
     pg = MagicMock()
-    ensure_table(pg)
-    assert pg.execute.call_count == 2
-    first_sql = pg.execute.call_args_list[0][0][0]
-    assert "CREATE TABLE IF NOT EXISTS arxiv_oai_pull_log" in first_sql
+    ensure_tables(pg)
+
+    # 共 4 条 DDL：2个 CREATE TABLE, 2个 CREATE INDEX
+    assert pg.execute.call_count == 4
+
+    sqls = [c[0][0] for c in pg.execute.call_args_list]
+
+    # 验证账本表
+    assert any("CREATE TABLE IF NOT EXISTS arxiv_oai_pull_log" in s for s in sqls)
+    # 验证业务目标表
+    assert any("CREATE TABLE IF NOT EXISTS arxiv_papers" in s for s in sqls)
+    assert any("idx_arxiv_papers_pub_date" in s for s in sqls)
 
 
 def test_ensure_initial_record_skips_when_exists():
@@ -486,7 +564,6 @@ def test_ensure_initial_record_skips_when_exists():
     pg = MagicMock()
     pg.fetch_one.return_value = (5,)
     ensure_initial_record(pg, "job-x", "2026-08-30")
-    # 只调用 fetch_one，不调用 execute
     pg.execute.assert_not_called()
 
 
@@ -499,7 +576,6 @@ def test_ensure_initial_record_inserts_when_empty():
     sql = pg.execute.call_args[0][0]
     assert "INSERT INTO arxiv_oai_pull_log" in sql
     assert "COMMITTED" in sql
-    # 参数检查
     params = pg.execute.call_args[0][1]
     assert params == ("job-x", "2026-08-30")
 
@@ -534,7 +610,6 @@ def test_mark_failed_truncates_error():
     long_error = "x" * 1000
     mark_failed(pg, "job-x", "2026-10-06", long_error)
     params = pg.execute.call_args[0][1]
-    # 第 3 个参数是 error，被截断到 500
     assert len(params[2]) == 500
 
 
@@ -545,5 +620,7 @@ def test_mark_failed_truncates_error():
 def test_smoke_imports():
     import jobs.job_daily_arxiv_oai_pull as job_mod
     assert hasattr(job_mod, "harvest")
+    assert hasattr(job_mod, "make_on_page")
+    assert hasattr(job_mod, "write_to_pg")
     assert hasattr(job_mod, "main")
     assert hasattr(job_mod, "run")
