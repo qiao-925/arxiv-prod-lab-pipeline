@@ -4,25 +4,25 @@
 职责：
     - 从 OAI-PMH 拉取 arXivRaw 记录
     - 提取 published_date（v1 发布时间），按 published_year/month 分区
-    - 按 arxiv_id upsert 写入 MinIO
+    - 按 arxiv_id upsert 写入 MinIO (数据湖归档)
+    - 按 arxiv_id upsert 写入 PostgreSQL arxiv_papers 表 (供业务直接查询)
     - 用 PG arxiv_oai_pull_log 记账，按天推进，断点续传
 
 调度方式：
     每晚定时执行，脚本自动从上次 COMMITTED 日期推进到"昨天"（UTC）。
-    幂等：重复执行不会重复拉同一天。
-
-用法：
-    ENV=test uv run python -m jobs.job_daily_arxiv_oai_pull
+    幂等：重复执行不会重复拉同一天；PG 写入采用 ON CONFLICT DO UPDATE。
 """
 import os
 import sys
 import time
+import json
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 import requests
+from psycopg2.extras import execute_values
 
 from common.logger import setup_logger
 from common.minio_client import MinIOClient, papers_arxiv_oai_state_path
@@ -35,6 +35,14 @@ NS = {
 }
 RATE_LIMIT_SECONDS = 3.0
 DEFAULT_INIT_DATE = "2026-08-30"
+
+# arxiv_papers 写入列
+COLUMNS = [
+    "arxiv_id", "title", "abstract", "authors", "categories",
+    "set_specs", "submitter", "comments", "journal_ref", "doi",
+    "report_no", "license", "versions", "published_date",
+    "datestamp", "oai_identifier"
+]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -117,30 +125,126 @@ def parse_record(record_elem) -> Optional[Dict[str, Any]]:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# arxiv_oai_pull_log 表操作
+# PostgreSQL 表操作
 # ═══════════════════════════════════════════════════════════════════════
 
-def ensure_table(pg: PGClient) -> None:
+def ensure_tables(pg: PGClient) -> None:
+    """建账本表 + 业务目标表"""
+    # 1. 账本表
     pg.execute("""
-        CREATE TABLE IF NOT EXISTS arxiv_oai_pull_log (
-            job_name       VARCHAR(64) NOT NULL,
-            pull_date      DATE        NOT NULL,
-            status         VARCHAR(20) NOT NULL,
-            record_count   INT         DEFAULT 0,
-            error_message  TEXT,
-            started_at     TIMESTAMP   DEFAULT NOW(),
-            committed_at   TIMESTAMP,
-            PRIMARY KEY (job_name, pull_date)
-        )
-    """)
+               CREATE TABLE IF NOT EXISTS arxiv_oai_pull_log
+               (
+                   job_name
+                   VARCHAR
+               (
+                   64
+               ) NOT NULL,
+                   pull_date DATE NOT NULL,
+                   status VARCHAR
+               (
+                   20
+               ) NOT NULL,
+                   record_count INT DEFAULT 0,
+                   error_message TEXT,
+                   started_at TIMESTAMP DEFAULT NOW
+               (
+               ),
+                   committed_at TIMESTAMP,
+                   PRIMARY KEY
+               (
+                   job_name,
+                   pull_date
+               )
+                   )
+               """)
     pg.execute("""
-        CREATE INDEX IF NOT EXISTS idx_arxiv_oai_pull_log_status
-        ON arxiv_oai_pull_log (job_name, status)
-    """)
+               CREATE INDEX IF NOT EXISTS idx_arxiv_oai_pull_log_status
+                   ON arxiv_oai_pull_log (job_name, status)
+               """)
+
+    # 2. 业务目标表 arxiv_papers
+    pg.execute("""
+               CREATE TABLE IF NOT EXISTS arxiv_papers
+               (
+                   arxiv_id
+                   TEXT
+                   PRIMARY
+                   KEY,
+                   title
+                   TEXT,
+                   abstract
+                   TEXT,
+                   authors
+                   TEXT,
+                   categories
+                   TEXT,
+                   set_specs
+                   TEXT,
+                   submitter
+                   TEXT,
+                   comments
+                   TEXT,
+                   journal_ref
+                   TEXT,
+                   doi
+                   TEXT,
+                   report_no
+                   TEXT,
+                   license
+                   TEXT,
+                   versions
+                   TEXT,
+                   published_date
+                   TEXT,
+                   datestamp
+                   TEXT,
+                   oai_identifier
+                   TEXT
+               )
+               """)
+    pg.execute("""
+               CREATE INDEX IF NOT EXISTS idx_arxiv_papers_pub_date
+                   ON arxiv_papers (published_date DESC)
+               """)
+
+
+def write_to_pg(pg: PGClient, records: List[Dict[str, Any]]) -> None:
+    """将解析后的数据批量 Upsert 到 PG"""
+    if not records:
+        return
+
+    rows = []
+    for r in records:
+        rows.append((
+            r.get("arxiv_id"),
+            r.get("title"),
+            r.get("abstract"),
+            r.get("authors"),
+            r.get("categories"),
+            json.dumps(r.get("set_specs"), ensure_ascii=False) if r.get("set_specs") else None,
+            r.get("submitter"),
+            r.get("comments"),
+            r.get("journal_ref"),
+            r.get("doi"),
+            r.get("report_no"),
+            r.get("license"),
+            json.dumps(r.get("versions"), ensure_ascii=False) if r.get("versions") else None,
+            r.get("published_date_iso"),
+            r.get("datestamp"),
+            r.get("oai_identifier")
+        ))
+
+    update_clause = ", ".join([f"{c} = EXCLUDED.{c}" for c in COLUMNS if c != "arxiv_id"])
+    sql = f"""
+        INSERT INTO arxiv_papers ({','.join(COLUMNS)}) 
+        VALUES %s 
+        ON CONFLICT (arxiv_id) DO UPDATE SET {update_clause}
+    """
+    with pg.cursor() as cur:
+        execute_values(cur, sql, rows, page_size=1000)
 
 
 def ensure_initial_record(pg: PGClient, job_name: str, init_date: str) -> None:
-    """首次运行时插入基线记录：(job_name, init_date, COMMITTED, 0)。"""
     row = pg.fetch_one(
         "SELECT COUNT(*) FROM arxiv_oai_pull_log WHERE job_name = %s",
         (job_name,),
@@ -148,18 +252,19 @@ def ensure_initial_record(pg: PGClient, job_name: str, init_date: str) -> None:
     if row is not None and row[0] > 0:
         return
     pg.execute("""
-        INSERT INTO arxiv_oai_pull_log
-            (job_name, pull_date, status, record_count, started_at, committed_at)
-        VALUES (%s, %s, 'COMMITTED', 0, NOW(), NOW())
-        ON CONFLICT (job_name, pull_date) DO NOTHING
-    """, (job_name, init_date))
+               INSERT INTO arxiv_oai_pull_log
+                   (job_name, pull_date, status, record_count, started_at, committed_at)
+               VALUES (%s, %s, 'COMMITTED', 0, NOW(), NOW()) ON CONFLICT (job_name, pull_date) DO NOTHING
+               """, (job_name, init_date))
 
 
 def query_last_committed(pg: PGClient, job_name: str) -> str:
     row = pg.fetch_one("""
-        SELECT MAX(pull_date) FROM arxiv_oai_pull_log
-        WHERE job_name = %s AND status = 'COMMITTED'
-    """, (job_name,))
+                       SELECT MAX(pull_date)
+                       FROM arxiv_oai_pull_log
+                       WHERE job_name = %s
+                         AND status = 'COMMITTED'
+                       """, (job_name,))
     if row is None or row[0] is None:
         raise RuntimeError(f"arxiv_oai_pull_log 中无 {job_name} 的 COMMITTED 记录")
     return str(row[0])
@@ -167,25 +272,25 @@ def query_last_committed(pg: PGClient, job_name: str) -> str:
 
 def mark_committed(pg: PGClient, job_name: str, pull_date: str, n: int) -> None:
     pg.execute("""
-        INSERT INTO arxiv_oai_pull_log
-            (job_name, pull_date, status, record_count, committed_at)
-        VALUES (%s, %s, 'COMMITTED', %s, NOW())
-        ON CONFLICT (job_name, pull_date) DO UPDATE
-        SET status = 'COMMITTED',
-            record_count = EXCLUDED.record_count,
-            committed_at = NOW(),
-            error_message = NULL
-    """, (job_name, pull_date, n))
+               INSERT INTO arxiv_oai_pull_log
+                   (job_name, pull_date, status, record_count, committed_at)
+               VALUES (%s, %s, 'COMMITTED', %s, NOW()) ON CONFLICT (job_name, pull_date) DO
+               UPDATE
+                   SET status = 'COMMITTED',
+                   record_count = EXCLUDED.record_count,
+                   committed_at = NOW(),
+                   error_message = NULL
+               """, (job_name, pull_date, n))
 
 
 def mark_failed(pg: PGClient, job_name: str, pull_date: str, error: str) -> None:
     pg.execute("""
-        INSERT INTO arxiv_oai_pull_log
-            (job_name, pull_date, status, error_message, started_at)
-        VALUES (%s, %s, 'FAILED', %s, NOW())
-        ON CONFLICT (job_name, pull_date) DO UPDATE
-        SET status = 'FAILED', error_message = EXCLUDED.error_message
-    """, (job_name, pull_date, error[:500]))
+               INSERT INTO arxiv_oai_pull_log
+                   (job_name, pull_date, status, error_message, started_at)
+               VALUES (%s, %s, 'FAILED', %s, NOW()) ON CONFLICT (job_name, pull_date) DO
+               UPDATE
+                   SET status = 'FAILED', error_message = EXCLUDED.error_message
+               """, (job_name, pull_date, error[:500]))
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -269,11 +374,12 @@ def harvest(from_date: str, until_date: str, *, on_page: OnPage, log) -> Dict[st
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# MinIO on_page
+# 双写：MinIO + PostgreSQL on_page
 # ═══════════════════════════════════════════════════════════════════════
 
-def make_minio_on_page(client: MinIOClient) -> OnPage:
+def make_on_page(client: MinIOClient, pg: PGClient) -> OnPage:
     def on_page(records: List[Dict[str, Any]]) -> int:
+        # 1. 写 MinIO (数据湖归档)
         groups: Dict[tuple, List[Dict[str, Any]]] = defaultdict(list)
         for r in records:
             pub_iso = r.get("published_date_iso", "")
@@ -284,7 +390,12 @@ def make_minio_on_page(client: MinIOClient) -> OnPage:
         for (year, month), rows in groups.items():
             object_name = papers_arxiv_oai_state_path(year, month)
             total += client.upsert_jsonl(object_name, rows)
+
+        # 2. 写 PostgreSQL (增量 Upsert)
+        write_to_pg(pg, records)
+
         return total
+
     return on_page
 
 
@@ -302,7 +413,7 @@ def run(env: str, log) -> None:
 
     pg = PGClient(log)
     try:
-        ensure_table(pg)
+        ensure_tables(pg)
         ensure_initial_record(pg, job_name, DEFAULT_INIT_DATE)
 
         last = query_last_committed(pg, job_name)
@@ -313,7 +424,7 @@ def run(env: str, log) -> None:
             return
 
         client = MinIOClient(log)
-        on_page = make_minio_on_page(client)
+        on_page = make_on_page(client, pg)
 
         current = date.fromisoformat(last)
         target = date.fromisoformat(target_date)
