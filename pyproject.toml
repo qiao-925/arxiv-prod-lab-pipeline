@@ -11,6 +11,7 @@ dependencies = [
     "psycopg2-binary>=2.9.9",
     "python-dotenv>=1.2.4",
     "requests>=2.34.2",
+    "scheduler>=0.8.11",
 ]
 
 [dependency-groups]
