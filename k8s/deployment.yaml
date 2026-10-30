@@ -1,39 +1,61 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: arxiv-app
+  name: arxiv-scheduler
   namespace: arxiv
   labels:
-    app: arxiv-app
+    app: arxiv-scheduler
 spec:
+  # 单实例：内部 job 用 threading.Lock 防重入，但跨 Pod 防不了
   replicas: 1
+
+  # ⚠️ 关键：Recreate 保证旧 Pod 完全退出后新 Pod 才启动，
+  #    防止滚动更新短暂双开导致两个 scheduler 同时拉同一小时窗口
   strategy:
     type: Recreate
+
   selector:
     matchLabels:
-      app: arxiv-app
+      app: arxiv-scheduler
+
   template:
     metadata:
       labels:
-        app: arxiv-app
+        app: arxiv-scheduler
     spec:
-      restartPolicy: Always
+      # 给 SIGTERM 后的 job 线程最多 5 分钟收尾
+      terminationGracePeriodSeconds: 300
+
       containers:
-        - name: app
+        - name: scheduler
           image: peterlocal/arxiv-prod-lab-pipeline:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
+
           env:
             - name: ENV
-              value: prod
-            - name: INFISICAL_CLIENT_ID
-              valueFrom:
-                secretKeyRef: {name: infisical, key: client_id}
-            - name: INFISICAL_CLIENT_SECRET
-              valueFrom:
-                secretKeyRef: {name: infisical, key: client_secret}
-            - name: INFISICAL_PROJECT_ID
-              valueFrom:
-                secretKeyRef: {name: infisical, key: project_id}
+              value: "prod"
+            - name: TZ
+              value: "Asia/Shanghai"
+
+          envFrom:
+            - secretRef:
+                name: infisical-credentials
+
+          # scheduler 本身很小，但内部拉起 3 个 Python 子进程（峰值 ~500MB/个）
           resources:
-            requests: {memory: "512Mi", cpu: "250m"}
-            limits: {memory: "2Gi", cpu: "1"}
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+
+          # liveness：只检查 scheduler 主进程存活（job 卡死靠自己的 timeout=3300s）
+          # 不配 readiness：无端口，就绪判断没意义
+          livenessProbe:
+            exec:
+              command: ["pgrep", "-f", "jobs.scheduler"]
+            initialDelaySeconds: 30
+            periodSeconds: 60
+            failureThreshold: 3
+            timeoutSeconds: 5
