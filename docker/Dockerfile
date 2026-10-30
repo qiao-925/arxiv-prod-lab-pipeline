@@ -27,6 +27,9 @@ COPY --from=builder /app/.venv /app/.venv
 COPY common/ ./common/
 COPY jobs/ ./jobs/
 
+RUN apt-get update && apt-get install -y --no-install-recommends procps \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN useradd --create-home --shell /bin/bash --uid 1000 app && \
     chown -R app:app /app
 USER app
