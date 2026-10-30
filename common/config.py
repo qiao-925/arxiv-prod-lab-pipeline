@@ -34,6 +34,8 @@ class _Schema:
     KAFKA_BOOTSTRAP: str
     KAFKA_MAX_REQUEST_SIZE: int
 
+    GITHUB_TOKEN:str
+
 
 _FIELDS: dict[str, type] = typing.get_type_hints(_Schema)
 _VALID_ENVS = ("test", "prod")
@@ -55,6 +57,7 @@ if typing.TYPE_CHECKING:
     MINIO_SECRET_KEY: str
     KAFKA_BOOTSTRAP: str
     KAFKA_MAX_REQUEST_SIZE: int
+    GITHUB_TOKEN: str
 
 
 def _require(name: str) -> str:
