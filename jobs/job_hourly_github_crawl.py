@@ -75,9 +75,10 @@ def ensure_table(pg):
         CREATE TABLE IF NOT EXISTS job_hourly_github_crawl_task (
             task_date DATE NOT NULL,
             task_hour INT NOT NULL,
-            status VARCHAR(20) NOT NULL DEFAULT 'pending',
+            status VARCHAR(20) NOT NULL DEFAULT 'running',
             cursor TIMESTAMP,
             found_count INT DEFAULT 0,
+            try_number INT NOT NULL DEFAULT 0,
             error_msg TEXT,
             created_at TIMESTAMP DEFAULT NOW(),
             updated_at TIMESTAMP DEFAULT NOW(),
@@ -87,17 +88,18 @@ def ensure_table(pg):
     pg.execute("""
         CREATE INDEX IF NOT EXISTS idx_crawl_pending
         ON job_hourly_github_crawl_task(status, task_date, task_hour)
-        WHERE status IN ('pending', 'paused')
+        WHERE status IN ('running', 'failed')
     """)
 
 
 def ensure_baseline(pg):
+    """GitScholar 已覆盖 2026-06-16 全天，从 6-16 23:00 'completed' 开始。"""
     row = pg.fetch_one("SELECT COUNT(*) FROM job_hourly_github_crawl_task")
     if row and row[0] > 0:
         return
     pg.execute("""
         INSERT INTO job_hourly_github_crawl_task (task_date, task_hour, status)
-        VALUES (%s, 0, 'pending')
+        VALUES (%s, 23, 'completed')
         ON CONFLICT DO NOTHING
     """, (BASELINE_DATE,))
 
@@ -105,7 +107,7 @@ def ensure_baseline(pg):
 def next_crawl_task(pg, target_date: date):
     row = pg.fetch_one("""
         SELECT task_date, task_hour FROM job_hourly_github_crawl_task
-        WHERE status IN ('pending', 'paused')
+        WHERE status IN ('running', 'failed')
         ORDER BY task_date, task_hour LIMIT 1
     """)
     if row:
@@ -387,19 +389,42 @@ def run(env, log):
                 log.info("✅ 所有小时窗口已处理")
                 break
             task_date, task_hour = task
-            mark_status(pg, task_date, task_hour, "running")
-            log.info(f"--- 处理 {task_date} hour={task_hour} ---")
 
+            # 确保记录存在（首次 / 推算出的新小时），标 running
+            pg.execute("""
+                INSERT INTO job_hourly_github_crawl_task (task_date, task_hour, status)
+                VALUES (%s, %s, 'running')
+                ON CONFLICT (task_date, task_hour) DO UPDATE
+                SET status = 'running', updated_at = NOW()
+            """, (task_date, task_hour))
+
+            log.info(f"--- 处理 {task_date} hour={task_hour} ---")
             try:
                 process_hour(pg, search_cli, rest_cli, task_date, task_hour, log)
                 mark_status(pg, task_date, task_hour, "completed")
-            except SearchPause:
-                mark_status(pg, task_date, task_hour, "paused", "Search 限流")
-                log.warning("Search 限流，暂停")
+            except (SearchPause, RestPause) as e:
+                log.warning(f"{type(e).__name__}，保持 running，下次从 cursor 继续")
                 return
-            except RestPause:
-                mark_status(pg, task_date, task_hour, "paused", "REST 限流")
-                log.warning("REST 限流，暂停")
+            except Exception as e:
+                # 3 次不成功 → failed（下次仍会重试）
+                pg.execute("""
+                    UPDATE job_hourly_github_crawl_task
+                    SET try_number = try_number + 1,
+                        status = CASE
+                            WHEN try_number + 1 >= %s THEN 'failed'
+                            ELSE 'running'
+                        END,
+                        error_msg = %s,
+                        updated_at = NOW()
+                    WHERE task_date = %s AND task_hour = %s
+                """, (MAX_README_RETRIES, str(e)[:500], task_date, task_hour))
+                row = pg.fetch_one("""
+                    SELECT try_number, status FROM job_hourly_github_crawl_task
+                    WHERE task_date = %s AND task_hour = %s
+                """, (task_date, task_hour))
+                log.error(
+                    f"处理失败 try={row[0]} status={row[1]}: {type(e).__name__}: {e}"
+                )
                 return
     finally:
         pg.close()
