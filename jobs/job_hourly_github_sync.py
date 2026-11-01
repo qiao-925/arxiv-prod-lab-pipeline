@@ -120,44 +120,57 @@ def ensure_baseline(pg):
     """, (BASELINE_DATE,))
 
 
-
 # ═══════════════════════════════════════════════════════════════════════
 # P0 锚点操作
 # ═══════════════════════════════════════════════════════════════════════
-def current_p0_date(pg, target):
+def current_p0_date(pg, target, log=None):
     row = pg.fetch_one("""
         SELECT task_date FROM job_hourly_github_sync_p0_task
         WHERE status = 'running' ORDER BY task_date LIMIT 1
     """)
     if row:
+        if log:
+            log.info(f"[P0] 恢复未完成日期 {row[0]}")
         return row[0]
     row = pg.fetch_one("""
         SELECT MAX(task_date) FROM job_hourly_github_sync_p0_task WHERE status = 'completed'
     """)
     if row and row[0]:
         nxt = row[0] + timedelta(days=1)
-        return nxt if nxt <= target else None
+        if nxt <= target:
+            if log:
+                log.info(f"[P0] 上一完成日期 {row[0]}，推进到 {nxt}")
+            return nxt
+        if log:
+            log.info(f"[P0] 已完成至 {row[0]}，目标 {target} 已追平")
+        return None
+    if log:
+        log.warning("[P0] 无任何锚点记录（baseline 缺失？）")
     return None
 
 
-def mark_p0(pg, task_date, status):
+def mark_p0(pg, task_date, status, log=None):
     pg.execute("""
         INSERT INTO job_hourly_github_sync_p0_task (task_date, status)
         VALUES (%s, %s)
         ON CONFLICT (task_date) DO UPDATE
         SET status = EXCLUDED.status, updated_at = NOW()
     """, (task_date, status))
+    if log:
+        log.info(f"[P0] 锚点 {task_date} 状态 -> {status}")
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # P2 锚点操作
 # ═══════════════════════════════════════════════════════════════════════
-def current_p2_round(pg):
+def current_p2_round(pg, log=None):
     row = pg.fetch_one("""
         SELECT round_number, snapshot_at FROM job_hourly_github_sync_p2_task
         WHERE status = 'running' ORDER BY round_number LIMIT 1
     """)
     if row:
+        if log:
+            log.info(f"[P2] 恢复未完成 round={row[0]} snapshot={row[1]}")
         return row[0], row[1]
     row = pg.fetch_one("SELECT COALESCE(MAX(round_number), 0) FROM job_hourly_github_sync_p2_task")
     new_num = (row[0] if row and row[0] else 0) + 1
@@ -166,31 +179,37 @@ def current_p2_round(pg):
         INSERT INTO job_hourly_github_sync_p2_task (round_number, snapshot_at, status)
         VALUES (%s, %s, 'running')
     """, (new_num, snapshot))
+    if log:
+        log.info(f"[P2] 新建 round={new_num} snapshot={snapshot}")
     return new_num, snapshot
 
 
-def mark_p2_completed(pg, round_number):
+def mark_p2_completed(pg, round_number, log=None):
     pg.execute("""
         UPDATE job_hourly_github_sync_p2_task
         SET status = 'completed', completed_at = NOW()
         WHERE round_number = %s
     """, (round_number,))
+    if log:
+        log.info(f"[P2] round={round_number} 标记完成")
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # repo_task 明细操作
 # ═══════════════════════════════════════════════════════════════════════
-def pick_one(pg, lane, task_date, round_number):
+def pick_one(pg, lane, task_date, round_number, log=None):
     """running + failed 都取，按 try_number 升序（先处理新失败的）。"""
-    return pg.fetch_one("""
+    row = pg.fetch_one("""
         SELECT id, repo_id, full_name, scan_start, scan_to, progress, status
         FROM job_hourly_github_sync_repo_task
         WHERE lane = %s AND task_date = %s AND round_number = %s
           AND status IN ('running', 'failed')
         ORDER BY try_number, id LIMIT 1
     """, (lane, task_date, round_number))
-
-
+    if log and row:
+        log.debug(f"[pick] lane={lane} date={task_date} round={round_number} "
+                  f"-> {row[2]} (status={row[6]}, sub_id={row[0]})")
+    return row
 
 
 def save_progress(pg, sub_id, progress):
@@ -202,8 +221,6 @@ def save_progress(pg, sub_id, progress):
 
 def mark_sub_completed(pg, sub_id):
     pg.execute("UPDATE job_hourly_github_sync_repo_task SET status='completed', updated_at=NOW() WHERE id=%s", (sub_id,))
-
-
 
 
 def mark_sub_failed(pg, sub_id, reason):
@@ -319,7 +336,7 @@ def build_graphql_query(full_name, metric, cursor=None):
 # 客户端
 # ═══════════════════════════════════════════════════════════════════════
 class StarClient:
-    def __init__(self, token):
+    def __init__(self, token, log=None):
         self.session = requests.Session()
         self.session.headers.update({
             "Authorization": f"Bearer {token}",
@@ -328,9 +345,12 @@ class StarClient:
         })
         self.remaining = None
         self._last = 0.0
+        self.log = log
 
     def fetch_page(self, full_name, page):
         if self.remaining is not None and self.remaining <= 0:
+            if self.log:
+                self.log.warning(f"[REST] remaining=0 触发限流暂停 (repo={full_name})")
             raise RestPause()
         gap = time.time() - self._last
         if gap < REST_THROTTLE:
@@ -342,32 +362,52 @@ class StarClient:
         )
         if "X-RateLimit-Remaining" in resp.headers:
             self.remaining = int(resp.headers["X-RateLimit-Remaining"])
+        if self.log:
+            self.log.debug(
+                f"[REST] star {full_name} page={page} status={resp.status_code} "
+                f"remaining={self.remaining}"
+            )
         if resp.status_code == 401:
+            if self.log:
+                self.log.error(f"[REST] 401 认证失败 (repo={full_name})")
             raise AuthError("REST 401")
         if resp.status_code == 404:
+            if self.log:
+                self.log.warning(f"[REST] 404 repo 不存在 (repo={full_name})")
             raise NotFoundError(full_name)
         if resp.status_code in (403, 429):
+            if self.log:
+                self.log.warning(f"[REST] {resp.status_code} 限流 (repo={full_name})")
             raise RestPause()
         resp.raise_for_status()
         return resp.json()
 
 
 class GraphQLClient:
-    def __init__(self, token):
+    def __init__(self, token, log=None):
         self.session = requests.Session()
         self.session.headers.update({
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         })
         self.remaining = None
+        self.log = log
 
     def execute(self, query):
         if self.remaining is not None and self.remaining <= 0:
+            if self.log:
+                self.log.warning("[GraphQL] remaining=0 触发限流暂停")
             raise GraphQLPause()
         resp = self.session.post(GRAPHQL_URL, json={"query": query}, timeout=60)
+        if self.log:
+            self.log.debug(f"[GraphQL] status={resp.status_code} remaining={self.remaining}")
         if resp.status_code == 401:
+            if self.log:
+                self.log.error("[GraphQL] 401 认证失败")
             raise AuthError("GraphQL 401")
         if resp.status_code in (403, 429):
+            if self.log:
+                self.log.warning(f"[GraphQL] {resp.status_code} 限流")
             raise GraphQLPause()
         resp.raise_for_status()
         payload = resp.json()
@@ -376,6 +416,8 @@ class GraphQLClient:
         if rate.get("remaining") is not None:
             self.remaining = int(rate["remaining"])
         errors = payload.get("errors") or []
+        if self.log and errors:
+            self.log.debug(f"[GraphQL] 返回 errors={errors[:1]}")
         if not data and errors:
             raise RuntimeError(f"GraphQL error: {errors[:1]}")
         return data, errors
@@ -395,83 +437,105 @@ def upsert_events(cur, metric, repo_id, counts):
 # ═══════════════════════════════════════════════════════════════════════
 # 单 metric 处理
 # ═══════════════════════════════════════════════════════════════════════
-def _process_star(pg, cli, sub_id, repo_id, full_name, scan_start, scan_to, progress):
+def _process_star(pg, cli, sub_id, repo_id, full_name, scan_start, scan_to, progress, log):
     p = progress.setdefault("star", {})
     page = p.get("page", 1)
     while True:
         try:
             payload = cli.fetch_page(full_name, page)
         except NotFoundError:
+            log.error(f"[star] {full_name} 404，标记失败")
             mark_sub_failed(pg, sub_id, f"404: star {full_name}")
             raise SubTaskDone
         more = star_has_more(payload, scan_start)
         if more and page >= MAX_PAGES:
+            log.error(f"[star] {full_name} 超过页数上限 {MAX_PAGES}，标记失败")
             fail_sub(pg, sub_id, f"star page limit")
             raise SubTaskDone
+        counts = parse_star_weeks(payload, scan_start, scan_to)
+        log.debug(f"[star] {full_name} page={page} 解析 {len(counts)} 天")
         with pg.cursor() as cur:
-            upsert_events(cur, "star", repo_id, parse_star_weeks(payload, scan_start, scan_to))
+            upsert_events(cur, "star", repo_id, counts)
         if not more:
             p["done"], p["page"] = True, None
             save_progress(pg, sub_id, progress)
+            log.info(f"[star] {full_name} 完成，共 {page} 页")
             return
         page += 1
         p["page"] = page
         save_progress(pg, sub_id, progress)
 
 
-def _process_graphql(pg, cli, sub_id, repo_id, full_name, scan_start, scan_to, metric, progress):
+def _process_graphql(pg, cli, sub_id, repo_id, full_name, scan_start, scan_to, metric, progress, log):
     p = progress.setdefault(metric, {})
     cursor, page = p.get("cursor"), p.get("page", 1)
     while True:
+        log.debug(f"[{metric}] {full_name} 请求 page={page} cursor={cursor is not None}")
         data, _ = cli.execute(build_graphql_query(full_name, metric, cursor))
         repo_data = data.get("repository")
         if repo_data is None:
+            log.error(f"[{metric}] {full_name} repo 不存在（404），标记失败")
             mark_sub_failed(pg, sub_id, f"404: {metric} repo missing")
             raise SubTaskDone
         conn = repo_data.get(metric)
         if conn is None:
+            log.error(f"[{metric}] {full_name} 返回 null，标记失败")
             fail_sub(pg, sub_id, f"{metric} null")
             raise SubTaskDone
         parsed = parse_connection(conn, scan_start, scan_to)
         more = bool(parsed["has_next"] and parsed["oldest"] and parsed["oldest"] > scan_start)
         if more and not parsed["end_cursor"]:
+            log.error(f"[{metric}] {full_name} hasNextPage 但无 endCursor，标记失败")
             fail_sub(pg, sub_id, f"{metric}: no endCursor")
             raise SubTaskDone
         if more and page >= MAX_PAGES:
+            log.error(f"[{metric}] {full_name} 超过页数上限 {MAX_PAGES}，标记失败")
             fail_sub(pg, sub_id, f"{metric} page limit")
             raise SubTaskDone
         with pg.cursor() as cur:
             upsert_events(cur, metric, repo_id, parsed["counts"])
+        log.debug(f"[{metric}] {full_name} page={page} 解析 {len(parsed['counts'])} 天 "
+                  f"oldest={parsed['oldest']} has_next={parsed['has_next']}")
         if not more:
             p["done"], p["cursor"], p["page"] = True, None, None
             save_progress(pg, sub_id, progress)
+            log.info(f"[{metric}] {full_name} 完成，共 {page} 页")
             return
         cursor, page = parsed["end_cursor"], page + 1
         p["cursor"], p["page"] = cursor, page
         save_progress(pg, sub_id, progress)
 
 
-def process_repo(pg, star_cli, gql_cli, sub):
+def process_repo(pg, star_cli, gql_cli, sub, log):
     sub_id, repo_id, full_name, scan_start, scan_to, progress, _ = sub
+    log.info(f"[repo] 开始 {full_name} (id={repo_id}) scan={scan_start}~{scan_to} sub_id={sub_id}")
     try:
         for metric in METRICS:
             if _pget(progress, metric).get("done"):
+                log.debug(f"[repo] {full_name} {metric} 已完成，跳过")
                 continue
+            log.info(f"[repo] {full_name} 处理 {metric}")
             if metric == "star":
-                _process_star(pg, star_cli, sub_id, repo_id, full_name, scan_start, scan_to, progress)
+                _process_star(pg, star_cli, sub_id, repo_id, full_name, scan_start, scan_to, progress, log)
             else:
-                _process_graphql(pg, gql_cli, sub_id, repo_id, full_name, scan_start, scan_to, metric, progress)
+                _process_graphql(pg, gql_cli, sub_id, repo_id, full_name, scan_start, scan_to, metric, progress, log)
+            log.info(f"[repo] {full_name} {metric} 完成")
     except SubTaskDone:
+        log.warning(f"[repo] {full_name} 子任务提前结束（见上方原因）")
         return
     except (RestPause, GraphQLPause):
         # 限流保持 running，不增 try_number
+        log.warning(f"[repo] {full_name} 限流中断，保持 running")
         raise
     except AuthError:
+        log.error(f"[repo] {full_name} 认证失败，终止")
         raise
     except (requests.RequestException, RuntimeError) as e:
+        log.error(f"[repo] {full_name} 异常: {type(e).__name__}: {e}")
         fail_sub(pg, sub_id, f"{type(e).__name__}: {e}")
         return
     mark_sub_completed(pg, sub_id)
+    log.info(f"[repo] {full_name} 全部完成")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -555,47 +619,59 @@ def ensure_p2_subtasks(pg, round_number, snapshot_at, limit):
 # ═══════════════════════════════════════════════════════════════════════
 def run_p0(pg, star_cli, gql_cli, target, log):
     while True:
-        task_date = current_p0_date(pg, target)
+        task_date = current_p0_date(pg, target, log)
         if task_date is None:
+            log.info("[P0] 无待处理日期，退出 P0")
             return True
-        mark_p0(pg, task_date, "running")
+        log.info(f"[P0] 开始处理 {task_date}")
+        mark_p0(pg, task_date, "running", log)
+        processed = 0
         while True:
-            sub = pick_one(pg, "p0", task_date, 0)
+            sub = pick_one(pg, "p0", task_date, 0, log)
             if sub is None:
-                if ensure_p0_subtasks(pg, task_date, BATCH_SIZE) == 0:
+                inserted = ensure_p0_subtasks(pg, task_date, BATCH_SIZE)
+                log.info(f"[P0] {task_date} 生成 {inserted} 个子任务")
+                if inserted == 0:
                     break
-                sub = pick_one(pg, "p0", task_date, 0)
+                sub = pick_one(pg, "p0", task_date, 0, log)
                 if sub is None:
+                    log.warning(f"[P0] {task_date} 生成子任务后仍无法取出，跳过")
                     break
             try:
-                process_repo(pg, star_cli, gql_cli, sub)
+                process_repo(pg, star_cli, gql_cli, sub, log)
+                processed += 1
             except (RestPause, GraphQLPause):
-                log.warning(f"P0 {task_date} 限流，保持 running")
+                log.warning(f"[P0] {task_date} 限流，保持 running，已处理 {processed} 个 repo")
                 return False
-        mark_p0(pg, task_date, "completed")
-        log.info(f"✅ P0 {task_date} completed")
+        mark_p0(pg, task_date, "completed", log)
+        log.info(f"✅ P0 {task_date} completed，共处理 {processed} 个 repo")
 
 
 def run_p2(pg, star_cli, gql_cli, log):
     if pg.fetch_one("SELECT 1 FROM features_repo LIMIT 1") is None:
-        log.info("features_repo 为空，P2 跳过")
+        log.info("[P2] features_repo 为空，跳过 P2")
         return
-    round_num, snapshot_at = current_p2_round(pg)
-    log.info(f"P2 round={round_num} snapshot={snapshot_at}")
+    round_num, snapshot_at = current_p2_round(pg, log)
+    log.info(f"[P2] round={round_num} snapshot={snapshot_at} 开始处理")
+    processed = 0
     while True:
-        sub = pick_one(pg, "p2", snapshot_at.date(), round_num)
+        sub = pick_one(pg, "p2", snapshot_at.date(), round_num, log)
         if sub is None:
-            if ensure_p2_subtasks(pg, round_num, snapshot_at, BATCH_SIZE) == 0:
-                mark_p2_completed(pg, round_num)
-                log.info(f"✅ P2 round {round_num} completed")
+            inserted = ensure_p2_subtasks(pg, round_num, snapshot_at, BATCH_SIZE)
+            log.info(f"[P2] round={round_num} 生成 {inserted} 个子任务")
+            if inserted == 0:
+                mark_p2_completed(pg, round_num, log)
+                log.info(f"✅ P2 round {round_num} completed，共处理 {processed} 个 repo")
                 return
-            sub = pick_one(pg, "p2", snapshot_at.date(), round_num)
+            sub = pick_one(pg, "p2", snapshot_at.date(), round_num, log)
             if sub is None:
+                log.warning(f"[P2] round={round_num} 生成子任务后仍无法取出，退出")
                 return
         try:
-            process_repo(pg, star_cli, gql_cli, sub)
+            process_repo(pg, star_cli, gql_cli, sub, log)
+            processed += 1
         except (RestPause, GraphQLPause):
-            log.warning("P2 paused")
+            log.warning(f"[P2] 限流暂停，round={round_num} 已处理 {processed} 个 repo")
             return
 
 
@@ -606,16 +682,22 @@ def run(env, log):
     log.info(f"GitHub Sync | env={env}")
     pg = PG_CLIENT_CLASS(log)
     try:
+        log.info("[init] 检查/创建数据库表")
         ensure_table(pg)
+        log.info("[init] 确保 baseline 锚点")
         ensure_baseline(pg)
         target = utc_yesterday()
-        star_cli = StarClient(_token())
-        gql_cli = GraphQLClient(_token())
+        log.info(f"[init] 目标日期 target={target}")
+        log.info("[init] 初始化 StarClient / GraphQLClient")
+        star_cli = StarClient(_token(), log)
+        gql_cli = GraphQLClient(_token(), log)
         if not run_p0(pg, star_cli, gql_cli, target, log):
-            log.info("P0 未追平，跳过 P2")
+            log.info("[main] P0 未追平（限流），跳过 P2")
             return
         run_p2(pg, star_cli, gql_cli, log)
+        log.info("[main] 本轮同步结束")
     finally:
+        log.info("[main] 关闭数据库连接")
         pg.close()
 
 
@@ -626,15 +708,23 @@ def verify(log):
         log.info("=== p0_task ===")
         for s, c in pg.fetch_all("SELECT status, COUNT(*) FROM job_hourly_github_sync_p0_task GROUP BY 1"):
             log.info(f"  {s}: {c}")
+        r = pg.fetch_one("SELECT MIN(task_date), MAX(task_date) FROM job_hourly_github_sync_p0_task")
+        log.info(f"  date range: {r[0]} ~ {r[1]}")
         log.info("=== p2_task ===")
         for r, s, snap in pg.fetch_all("SELECT round_number, status, snapshot_at FROM job_hourly_github_sync_p2_task ORDER BY round_number DESC LIMIT 5"):
             log.info(f"  round {r} / {s} / snapshot={snap}")
         log.info("=== repo_task ===")
         for lane, s, c in pg.fetch_all("SELECT lane, status, COUNT(*) FROM job_hourly_github_sync_repo_task GROUP BY 1, 2 ORDER BY 1, 2"):
             log.info(f"  {lane} / {s}: {c}")
+        pending = pg.fetch_one("""
+            SELECT COUNT(*) FROM job_hourly_github_sync_repo_task
+            WHERE status IN ('running', 'failed')
+        """)
+        log.info(f"  pending(running+failed): {pending[0] if pending else 0}")
+        log.info("=== events ===")
         for metric, table in EVENT_TABLES.items():
             r = pg.fetch_one(f"SELECT COUNT(*), MIN(date), MAX(date) FROM {table}")
-            log.info(f"events {metric}: rows={r[0]} min={r[1]} max={r[2]}")
+            log.info(f"  events {metric}: rows={r[0]} min={r[1]} max={r[2]}")
         return 0
     finally:
         pg.close()
