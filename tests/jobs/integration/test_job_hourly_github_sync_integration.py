@@ -25,7 +25,7 @@ p0_task / p2_task（锚点）：
     completed = 全部子任务完成
 
     关键区分：
-        - 限流（RestPause / GraphQLPause）：try_number + 1，< MAX_TRIES 保持 running，>= 3 转 failed
+        - 限流（RestPause / GraphQLPause）：job 级停止信号，不改 repo 状态；与失败重试解耦
         - 瞬时错误：try_number + 1，>= 3 转 failed 且 pick_one 不再出队
         - 404：直接 mark_sub_failed，try_number + 1，error_msg 前缀 '404:'
         - 单 metric 完成 → 记录 progress JSONB，下次从断点继续
@@ -54,7 +54,7 @@ P2 全量扫描的特殊处理：
     ✅ 水位内 failed 任务能被 run_p0 重试，耗尽 failed 被 pick_one 排除
     ✅ progress JSONB 中途保留（断点续传）
     ✅ run() 的 P0/P2 分流控制流
-    ✅ 单 repo 连续 403 三次后让位，P0/P2 队列继续跑完
+    ✅ 403 立即停止本轮；失败仓库仍按 MAX_TRIES 水位跳过
 
 不写"只查调用次数"的弱断言。
 """
@@ -266,8 +266,8 @@ def test_run_p0_pending_to_completed(mock_star, mock_gql, pg):
 @patch("jobs.job_hourly_github_sync.ensure_p0_subtasks", return_value=0)
 @patch.object(GraphQLClient, "execute")
 @patch.object(StarClient, "fetch_page")
-def test_run_p0_rate_limit_exhausts_and_skips(mock_star, mock_gql, mock_ensure, pg):
-    """端到端：单 repo 连续限流 3 次 → failed，run_p0 继续跑完当天。"""
+def test_run_p0_stops_on_rate_limit(mock_star, mock_gql, mock_ensure, pg):
+    """端到端：REST 403 → run_p0 立即停止，repo 保持 running/try=0，下次 cron 重试。"""
     mock_star.side_effect = RestPause()
 
     pg.execute("""
@@ -283,22 +283,22 @@ def test_run_p0_rate_limit_exhausts_and_skips(mock_star, mock_gql, mock_ensure, 
     """, (TEST_DATE, TEST_REPO_ID, TEST_FULL_NAME, date(2026, 10, 1), TEST_DATE))
 
     result = run_p0(pg, StarClient("fake"), GraphQLClient("fake"), TEST_DATE, MagicMock())
-    assert result is True
+    assert result is False
 
     row = pg.fetch_one(
         "SELECT status, try_number FROM job_hourly_github_sync_repo_task WHERE repo_id = %s",
         (TEST_REPO_ID,),
     )
-    assert row == ("failed", MAX_TRIES)
+    assert row == ("running", 0)
 
     p0_row = pg.fetch_one(
         "SELECT status FROM job_hourly_github_sync_p0_task WHERE task_date = %s",
         (TEST_DATE,),
     )
-    assert p0_row[0] == "completed"
+    assert p0_row[0] == "running"
 
-    # 耗尽的 failed 不再出队，队列不空转
-    assert pick_one(pg, "p0", TEST_DATE, 0) is None
+    # 403 不消耗重试水位，repo 仍在队列，下次 cron 可继续
+    assert pick_one(pg, "p0", TEST_DATE, 0) is not None
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -560,8 +560,8 @@ def test_run_p2_completes(mock_star, mock_gql, mock_round, mock_ensure, pg):
 @patch("jobs.job_hourly_github_sync.ensure_p2_subtasks", return_value=0)
 @patch.object(GraphQLClient, "execute")
 @patch.object(StarClient, "fetch_page")
-def test_run_p2_rate_limit_exhausts_and_completes(mock_star, mock_gql, mock_ensure, pg):
-    """端到端：P2 单 repo 连续限流 3 次 → failed，round 仍标记 completed。"""
+def test_run_p2_stops_on_rate_limit(mock_star, mock_gql, mock_ensure, pg):
+    """端到端：P2 遇到 403 → 停止，repo 保持 running/try=0，round 保持 running。"""
     mock_star.side_effect = RestPause()
     snap = datetime(2026, 10, 30, tzinfo=timezone.utc)
     round_num = 2000
@@ -590,14 +590,14 @@ def test_run_p2_rate_limit_exhausts_and_completes(mock_star, mock_gql, mock_ensu
             "WHERE lane='p2' AND round_number=%s AND repo_id = %s",
             (round_num, TEST_REPO_ID),
         )
-        assert row == ("failed", MAX_TRIES)
+        assert row == ("running", 0)
 
         row = pg.fetch_one(
             "SELECT status FROM job_hourly_github_sync_p2_task WHERE round_number = %s",
             (round_num,),
         )
-        assert row[0] == "completed"
-        assert pick_one(pg, "p2", snap.date(), round_num) is None
+        assert row[0] == "running"
+        assert pick_one(pg, "p2", snap.date(), round_num) is not None
     finally:
         pg.execute("DELETE FROM job_hourly_github_sync_repo_task WHERE lane='p2' AND round_number=%s", (round_num,))
         pg.execute("DELETE FROM job_hourly_github_sync_p2_task WHERE round_number = %s", (round_num,))

@@ -6,8 +6,8 @@
     - P2（全量扫描）：走 job_hourly_github_sync_p2_task 按轮推进，snapshot_at 锁定
     - 明细落库：job_hourly_github_sync_repo_task (lane='p0' / 'p2')
     - star 走 REST；fork/issue/pr 走 GraphQL
-    - 403/429 限流（RestPause / GraphQLPause）计入重试水位，达到 MAX_TRIES 后标 failed
-    - 限流由 process_repo 内部消化，不中断整轮队列
+    - 403/429 限流（RestPause / GraphQLPause）是 job 级停止信号，立即停止本轮
+    - 限流与 repo 失败重试解耦：限流不改 try_number/status，失败重试仅用于瞬时错误/404
 
 用法：
     ENV=test python -m jobs.job_hourly_github_sync run
@@ -526,10 +526,9 @@ def process_repo(pg, star_cli, gql_cli, sub, log):
         log.warning(f"[repo] {full_name} 子任务提前结束（见上方原因）")
         return
     except (RestPause, GraphQLPause) as e:
-        # 限流计入重试水位，耗尽后由 pick_one 排除，避免单个 repo 阻塞队列
-        fail_sub(pg, sub_id, f"rate_limit: {type(e).__name__}")
-        log.warning(f"[repo] {full_name} 限流，已重试 {try_number + 1}/{MAX_TRIES}")
-        return
+        # 403/429 是 job 级停止信号，与失败重试解耦：不改 try_number/status
+        log.warning(f"[repo] {full_name} {type(e).__name__} 限流，本轮停止")
+        raise
     except AuthError:
         log.error(f"[repo] {full_name} 认证失败，终止")
         raise
@@ -640,8 +639,12 @@ def run_p0(pg, star_cli, gql_cli, target, log):
                 if sub is None:
                     log.warning(f"[P0] {task_date} 生成子任务后仍无法取出，跳过")
                     break
-            process_repo(pg, star_cli, gql_cli, sub, log)
-            processed += 1
+            try:
+                process_repo(pg, star_cli, gql_cli, sub, log)
+                processed += 1
+            except (RestPause, GraphQLPause):
+                log.warning(f"[P0] {task_date} 限流，保持 running，已处理 {processed} 个 repo")
+                return False
         mark_p0(pg, task_date, "completed", log)
         log.info(f"✅ P0 {task_date} completed，共处理 {processed} 个 repo")
 
@@ -666,8 +669,12 @@ def run_p2(pg, star_cli, gql_cli, log):
             if sub is None:
                 log.warning(f"[P2] round={round_num} 生成子任务后仍无法取出，退出")
                 return
-        process_repo(pg, star_cli, gql_cli, sub, log)
-        processed += 1
+        try:
+            process_repo(pg, star_cli, gql_cli, sub, log)
+            processed += 1
+        except (RestPause, GraphQLPause):
+            log.warning(f"[P2] 限流暂停，round={round_num} 已处理 {processed} 个 repo")
+            return
 
 
 # ═══════════════════════════════════════════════════════════════════════
