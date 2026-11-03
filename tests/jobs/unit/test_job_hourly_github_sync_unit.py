@@ -19,7 +19,7 @@ p0_task / p2_task（锚点）：
     completed = 全部子任务完成
 
     关键区分：
-        - 限流（RestPause / GraphQLPause）：try_number + 1，< MAX_TRIES 保持 running，>= 3 转 failed
+        - 限流（RestPause / GraphQLPause）：job 级停止信号，不改 repo 状态；与失败重试解耦
         - 瞬时错误（RuntimeError / 网络）：try_number + 1，>= 3 转 failed
         - failed 水位：try_number >= MAX_TRIES 的 failed 不再被 pick_one 取出
         - 404：直接 mark_sub_failed，try_number + 1，error_msg 前缀 '404:'
@@ -30,7 +30,7 @@ p0_task / p2_task（锚点）：
 ═══════════════════════════════════════════════════════════════════════
 P0 风险（必须覆盖）：
     - try_number 边界：<3 保持 running，>=3 转 failed
-    - 限流/瞬时错误正确消耗 try_number 并在水位处转 failed：否则单 repo 持续 403 会无限重试、阻塞队列
+    - 限流立即停止本轮，不写入 repo 失败状态；瞬时错误/404 才走重试水位
     - 404 与瞬时错误的区分：404 直接 failed，网络错误要重试
     - pick_one 查 running + 水位内 failed，并排除已耗尽 failed：否则失败任务要么永不重试，要么永久占队
     - progress JSONB 的断点续传
@@ -230,21 +230,17 @@ def test_process_repo_404_marks_failed(mock_upsert):
 @pytest.mark.parametrize("exc_cls", [RestPause, GraphQLPause])
 @patch("jobs.job_hourly_github_sync.upsert_events")
 @patch("jobs.job_hourly_github_sync.save_progress")
-def test_process_repo_rate_limit_counts_try(mock_save, mock_upsert, exc_cls):
-    """限流（RestPause / GraphQLPause）→ fail_sub 计重试水位，process_repo 返回。"""
+def test_process_repo_rate_limit_reraises_without_fail_sub(mock_save, mock_upsert, exc_cls):
+    """限流（RestPause / GraphQLPause）→ 上抛停止信号，不调 fail_sub、不改 try_number。"""
     pg = MagicMock()
     star_cli = MagicMock()
     star_cli.fetch_page.side_effect = exc_cls()
     sub = (1, 123, "o/r", date(2026, 10, 1), date(2026, 10, 2), {}, "running", 0)
 
-    process_repo(pg, star_cli, MagicMock(), sub, MagicMock())
+    with pytest.raises(exc_cls):
+        process_repo(pg, star_cli, MagicMock(), sub, MagicMock())
 
-    updates = [
-        c for c in pg.execute.call_args_list
-        if "try_number = try_number + 1" in str(c[0][0])
-    ]
-    assert len(updates) == 1
-    assert updates[0][0][1][1].startswith("rate_limit:")
+    pg.execute.assert_not_called()
 
 
 @patch("jobs.job_hourly_github_sync.upsert_events")
@@ -393,25 +389,22 @@ def test_run_p0_completes(mock_current, mock_pick, mock_ensure, mock_process, mo
 @patch("jobs.job_hourly_github_sync.ensure_p0_subtasks")
 @patch("jobs.job_hourly_github_sync.pick_one")
 @patch("jobs.job_hourly_github_sync.current_p0_date")
-def test_run_p0_continues_after_rate_limit_handled(
+def test_run_p0_stops_on_rate_limit(
     mock_current, mock_pick, mock_ensure, mock_process, mock_mark
 ):
-    """P0：限流被 process_repo 内部消化后，run_p0 继续取下一个 repo。"""
+    """P0：403 上抛后 run_p0 停止，不 mark completed。"""
     pg = MagicMock()
-    mock_current.side_effect = [date(2026, 10, 1), None]
-    mock_pick.side_effect = [
-        (1, 123, "o/r", date(2026, 10, 1), date(2026, 10, 2), {}, "running", 0),
-        (2, 124, "o/r2", date(2026, 10, 1), date(2026, 10, 2), {}, "running", 0),
-        None,
-    ]
+    mock_current.return_value = date(2026, 10, 1)
+    mock_pick.return_value = (1, 123, "o/r", date(2026, 10, 1), date(2026, 10, 2), {}, "running", 0)
     mock_ensure.return_value = 0
+    mock_process.side_effect = RestPause()
 
     log = MagicMock()
     result = run_p0(pg, MagicMock(), MagicMock(), date(2026, 10, 5), log)
 
-    assert result is True
-    assert mock_process.call_count == 2
-    mock_mark.assert_any_call(pg, date(2026, 10, 1), "completed", log)
+    assert result is False
+    mock_process.assert_called_once()
+    assert not any(call[0][2] == "completed" for call in mock_mark.call_args_list)
 
 
 @patch("jobs.job_hourly_github_sync.mark_p2_completed")
@@ -419,25 +412,22 @@ def test_run_p0_continues_after_rate_limit_handled(
 @patch("jobs.job_hourly_github_sync.pick_one")
 @patch("jobs.job_hourly_github_sync.current_p2_round")
 @patch("jobs.job_hourly_github_sync.process_repo")
-def test_run_p2_continues_after_rate_limit_handled(
+def test_run_p2_stops_on_rate_limit(
     mock_process, mock_round, mock_pick, mock_ensure, mock_mark
 ):
-    """P2：限流被 process_repo 内部消化后，run_p2 继续直到 round completed。"""
+    """P2：403 上抛后 run_p2 停止，不 mark completed。"""
     pg = MagicMock()
     pg.fetch_one.return_value = (1,)  # features_repo 非空
     snap = datetime(2026, 10, 1, tzinfo=timezone.utc)
     mock_round.return_value = (1, snap)
-    mock_pick.side_effect = [
-        (1, 123, "o/r", date(2026, 10, 1), date(2026, 10, 2), {}, "running", 0),
-        (2, 124, "o/r2", date(2026, 10, 1), date(2026, 10, 2), {}, "running", 0),
-        None,
-    ]
+    mock_pick.return_value = (1, 123, "o/r", date(2026, 10, 1), date(2026, 10, 2), {}, "running", 0)
     mock_ensure.return_value = 0
+    mock_process.side_effect = RestPause()
 
     run_p2(pg, MagicMock(), MagicMock(), MagicMock())
 
-    assert mock_process.call_count == 2
-    mock_mark.assert_called_once()
+    assert mock_process.call_count == 1
+    mock_mark.assert_not_called()
 
 
 def test_run_p2_empty_features_repo():
