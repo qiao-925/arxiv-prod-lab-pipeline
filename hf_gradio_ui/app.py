@@ -15,6 +15,13 @@ import threading
 
 import gradio as gr
 import pandas as pd
+import spaces
+
+
+@spaces.GPU
+def gpu_runtime_check(value: int = 0) -> str:
+    """ZeroGPU 启动检测与运行时可用性检查，返回可序列化字符串。"""
+    return f"GPU runtime ready: {value}"
 
 
 @spaces.GPU
