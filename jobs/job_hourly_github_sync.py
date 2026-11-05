@@ -6,7 +6,8 @@
     - P2（全量扫描）：走 job_hourly_github_sync_p2_task 按轮推进，snapshot_at 锁定
     - 明细落库：job_hourly_github_sync_repo_task (lane='p0' / 'p2')
     - star 走 REST；fork/issue/pr 走 GraphQL
-    - 限流分别捕获 RestPause / GraphQLPause
+    - 403/429 限流（RestPause / GraphQLPause）是 job 级停止信号，立即停止本轮
+    - 限流与 repo 失败重试解耦：限流不改 try_number/status，失败重试仅用于瞬时错误/404
 
 用法：
     ENV=test python -m jobs.job_hourly_github_sync run
@@ -198,14 +199,15 @@ def mark_p2_completed(pg, round_number, log=None):
 # repo_task 明细操作
 # ═══════════════════════════════════════════════════════════════════════
 def pick_one(pg, lane, task_date, round_number, log=None):
-    """running + failed 都取，按 try_number 升序（先处理新失败的）。"""
+    """running + 水位内 failed 都取；failed 且 try_number >= MAX_TRIES 不再出队。"""
     row = pg.fetch_one("""
-        SELECT id, repo_id, full_name, scan_start, scan_to, progress, status
+        SELECT id, repo_id, full_name, scan_start, scan_to, progress, status, try_number
         FROM job_hourly_github_sync_repo_task
         WHERE lane = %s AND task_date = %s AND round_number = %s
           AND status IN ('running', 'failed')
+          AND NOT (status = 'failed' AND try_number >= %s)
         ORDER BY try_number, id LIMIT 1
-    """, (lane, task_date, round_number))
+    """, (lane, task_date, round_number, MAX_TRIES))
     if log and row:
         log.debug(f"[pick] lane={lane} date={task_date} round={round_number} "
                   f"-> {row[2]} (status={row[6]}, sub_id={row[0]})")
@@ -224,7 +226,7 @@ def mark_sub_completed(pg, sub_id):
 
 
 def mark_sub_failed(pg, sub_id, reason):
-    """确定性失败（404 等），下次 pick 仍会重试。"""
+    """确定性失败（404 等），递增 try_number；耗尽后不再出队。"""
     pg.execute("""
         UPDATE job_hourly_github_sync_repo_task
         SET status = 'failed',
@@ -236,7 +238,7 @@ def mark_sub_failed(pg, sub_id, reason):
 
 
 def fail_sub(pg, sub_id, error):
-    """瞬时错误：< 3 保持 running，>= 3 标 failed（下次仍重试）。"""
+    """瞬时错误：< MAX_TRIES 保持 running，>= MAX_TRIES 标 failed 且不再出队。"""
     pg.execute("""
         UPDATE job_hourly_github_sync_repo_task
         SET try_number = try_number + 1,
@@ -507,7 +509,7 @@ def _process_graphql(pg, cli, sub_id, repo_id, full_name, scan_start, scan_to, m
 
 
 def process_repo(pg, star_cli, gql_cli, sub, log):
-    sub_id, repo_id, full_name, scan_start, scan_to, progress, _ = sub
+    sub_id, repo_id, full_name, scan_start, scan_to, progress, _, try_number = sub
     log.info(f"[repo] 开始 {full_name} (id={repo_id}) scan={scan_start}~{scan_to} sub_id={sub_id}")
     try:
         for metric in METRICS:
@@ -523,9 +525,9 @@ def process_repo(pg, star_cli, gql_cli, sub, log):
     except SubTaskDone:
         log.warning(f"[repo] {full_name} 子任务提前结束（见上方原因）")
         return
-    except (RestPause, GraphQLPause):
-        # 限流保持 running，不增 try_number
-        log.warning(f"[repo] {full_name} 限流中断，保持 running")
+    except (RestPause, GraphQLPause) as e:
+        # 403/429 是 job 级停止信号，与失败重试解耦：不改 try_number/status
+        log.warning(f"[repo] {full_name} {type(e).__name__} 限流，本轮停止")
         raise
     except AuthError:
         log.error(f"[repo] {full_name} 认证失败，终止")
