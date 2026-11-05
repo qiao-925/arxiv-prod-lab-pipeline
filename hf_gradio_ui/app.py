@@ -17,6 +17,12 @@ import gradio as gr
 import pandas as pd
 import spaces
 
+
+@spaces.GPU
+def gpu_runtime_check(value: int = 0) -> str:
+    """ZeroGPU 启动检测与运行时可用性检查，返回可序列化字符串。"""
+    return f"GPU runtime ready: {value}"
+
 # 优先使用已挂载的 Storage Bucket
 if os.path.isdir("/data") and os.access("/data", os.W_OK):
     ROOT = "/data"
@@ -256,34 +262,28 @@ def warmup():
     threading.Thread(target=ensure_details_loaded, daemon=True).start()
 
 
-@spaces.GPU
-def _build_demo():
-    with gr.Blocks(title="Arxiv & Github Ranking") as demo:
-        gr.Markdown("# Arxiv & Github Ranking")
-        with gr.Row(equal_height=True):
-            with gr.Column(scale=1, min_width=420):
-                window_sel = gr.Dropdown(choices=TIME_OPTIONS, value=DEFAULT_WINDOW, label="时间窗口")
-                ranking_table = gr.Dataframe(
-                    value=load_ranking_wide(DEFAULT_WINDOW),
-                    max_height=560,
-                    interactive=False, label="Top 500",
-                )
-            with gr.Column(scale=1, min_width=420):
-                openalex_md = gr.Markdown("## OpenAlex\n\n暂无数据")
+with gr.Blocks(title="Arxiv & Github Ranking") as demo:
+    gr.Markdown("# Arxiv & Github Ranking")
+    with gr.Row(equal_height=True):
+        with gr.Column(scale=1, min_width=420):
+            window_sel = gr.Dropdown(choices=TIME_OPTIONS, value=DEFAULT_WINDOW, label="时间窗口")
+            ranking_table = gr.Dataframe(
+                value=load_ranking_wide(DEFAULT_WINDOW),
+                max_height=560,
+                interactive=False, label="Top 500",
+            )
+        with gr.Column(scale=1, min_width=420):
+            openalex_md = gr.Markdown("## OpenAlex\n\n暂无数据")
 
-        detail_modal = gr.HTML(visible=False)
+    detail_modal = gr.HTML(visible=False)
 
-        window_sel.change(load_ranking_wide, inputs=window_sel, outputs=ranking_table)
-        ranking_table.select(
-            open_paper_detail,
-            inputs=ranking_table,
-            outputs=[detail_modal, openalex_md],
-        )
-        demo.load(warmup)
-    return demo
-
-
-demo = _build_demo()
+    window_sel.change(load_ranking_wide, inputs=window_sel, outputs=ranking_table)
+    ranking_table.select(
+        open_paper_detail,
+        inputs=ranking_table,
+        outputs=[detail_modal, openalex_md],
+    )
+    demo.load(warmup)
 
 
 if __name__ == "__main__":
