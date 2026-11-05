@@ -28,7 +28,7 @@ TZ = ZoneInfo("Asia/Shanghai")
 def test_job_specs_contains_merged_jobs():
     """确认旧的 discover/readme 已被合并掉，不再出现。"""
     ids = {spec.id for spec in sched.JOB_SPECS}
-    assert ids == {"oai_pull", "github_crawl", "github_sync"}
+    assert ids == {"oai_pull", "github_crawl", "github_sync", "github_rank"}
     assert "github_discover" not in ids
     assert "github_readme_extract" not in ids
 
@@ -41,6 +41,8 @@ def test_job_specs_modules_match_files():
             assert "github_crawl" in spec.module
         if spec.id == "github_sync":
             assert "github_sync" in spec.module
+        if spec.id == "github_rank":
+            assert "github_rank" in spec.module
 
 
 def test_job_specs_argv_for_long_running_jobs():

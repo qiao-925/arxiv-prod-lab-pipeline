@@ -25,6 +25,12 @@
                               events_stars / events_forks
                               events_issues / events_prs
 
+  GitHub 排名每日快照（当天最多生成一次）
+    PG 聚合 SQL ──每小时（水位自控）──► job_daily_github_rank
+                                          ├─► ranking_top500 / top500_arxiv_repo
+                                          ├─► paper_details / repo_details
+                                          └─► HF Bucket parquet（供 Gradio）
+
 二、Job 清单
 
   | Job                         | 水位 / 状态表                                              | 写入                                  | 只读                                  |
@@ -33,6 +39,7 @@
   | job_hourly_github_crawl     | job_hourly_github_crawl_task                               | features_repo、edges_repo_arxiv       | —                                     |
   | job_hourly_github_sync      | job_hourly_github_sync_p0_task / p2_task / repo_task       | events_stars/forks/issues/prs         | features_repo、edges_repo_arxiv、     |
   |                             |                                                            |                                       | arxiv_papers                          |
+  | job_daily_github_rank       | github_rank_run_log                                        | 四张排名表 + HF Bucket parquet        | events_*、features_repo、edges_repo_arxiv、arxiv_papers |
 
 三、调度规则
 
@@ -42,6 +49,7 @@
        OAI     MAX(COMMITTED) >= 昨天
        crawl   task_date/task_hour 推进到昨天
        sync    P0/P2 工作状态自控（限额暂停后续跑）
+       rank    当天 COMPLETED 即跳过，失败/未完成下轮重试
   4. 同 job 不并发：进程内 threading.Lock + APScheduler max_instances=1。
      多副本部署时需把 Lock 换成 PG advisory lock（当前 replicas=1）。
 
@@ -59,6 +67,7 @@
       * job_hourly_github_crawl 拥有 job_hourly_github_crawl_task，对 canonical 做 upsert
       * job_hourly_github_sync 拥有 p0_task/p2_task/repo_task，对 events_* 做 upsert
       * job_daily_arxiv_oai_pull 拥有 arxiv_oai_pull_log，对 arxiv_papers/MinIO 做 upsert
+      * job_daily_github_rank 拥有 github_rank_run_log，对四张排名表/ HF Bucket 做覆盖写
   - GitScholar 历史导入是一次性 seed，禁止 TRUNCATE / DROP / 全表删除。
   - 所有长任务用 PG 账本表 + 状态列续跑，重跑幂等。
 """
@@ -100,6 +109,7 @@ JOB_SPECS = [
     JobSpec("oai_pull", "OAI-PMH pull", "jobs.job_daily_arxiv_oai_pull"),
     JobSpec("github_crawl", "GitHub crawl", "jobs.job_hourly_github_crawl", argv=("run",)),
     JobSpec("github_sync", "GitHub sync", "jobs.job_hourly_github_sync", argv=("run",)),
+    JobSpec("github_rank", "GitHub rank", "jobs.job_daily_github_rank"),
 ]
 
 # 进程内互斥：启动任务和整点任务使用不同 APScheduler job id，

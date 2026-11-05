@@ -35,6 +35,9 @@ class _Schema:
     KAFKA_MAX_REQUEST_SIZE: int
 
     GITHUB_TOKEN:str
+    HF_BUCKET_PATH: str
+    HF_TOKEN: str
+    HF_ENDPOINT: str
 
 
 _FIELDS: dict[str, type] = typing.get_type_hints(_Schema)
@@ -58,6 +61,17 @@ if typing.TYPE_CHECKING:
     KAFKA_BOOTSTRAP: str
     KAFKA_MAX_REQUEST_SIZE: int
     GITHUB_TOKEN: str
+    HF_BUCKET_PATH: str
+    HF_TOKEN: str
+    HF_ENDPOINT: str
+
+
+# HF Bucket 配置可来自 Infisical，也可由进程环境变量兜底（默认官方 endpoint）。
+_OPTIONAL_ENV_FIELDS = {
+    "HF_BUCKET_PATH": "",
+    "HF_TOKEN": "",
+    "HF_ENDPOINT": "https://hf-mirror.com",
+}
 
 
 def _require(name: str) -> str:
@@ -101,6 +115,14 @@ def _load() -> None:
         tag_filters=[],
     )
     secrets_map = {s.secretKey: s.secretValue.strip() for s in resp.secrets}
+
+    # HF 相关字段允许进程环境变量覆盖 Infisical，便于本地/镜像环境手工验证
+    for name, default in _OPTIONAL_ENV_FIELDS.items():
+        env_value = os.getenv(name)
+        if env_value is not None:
+            secrets_map[name] = env_value
+        elif name not in secrets_map:
+            secrets_map[name] = default
 
     # 缺字段检查
     missing = [k for k in _FIELDS if k not in secrets_map]
