@@ -1,0 +1,283 @@
+"""Gradio: Arxiv & Github Ranking（读挂载 Parquet / HF Bucket）。
+
+布局：
+    - 左侧 50%：时间窗口筛选 + Top 500 表格（Star/Fork/Issue/PR 四列）
+    - 右侧 50%：OpenAlex 预留面板（当前 openalex_data 为空时展示空态）
+    - 点击榜单行：打开非全屏大弹窗（HTML 覆盖层），展示论文详情和关联仓库
+    - 榜单表头可点击排序
+数据源：优先 /data 挂载目录，回退到 HF_BUCKET_PATH 指定的 hf:// bucket 或本地目录。
+"""
+import functools
+import html
+import json
+import os
+import threading
+
+import gradio as gr
+import pandas as pd
+
+# 优先使用已挂载的 Storage Bucket
+if os.path.isdir("/data") and os.access("/data", os.W_OK):
+    ROOT = "/data"
+    print("✅ 使用挂载的 Storage Bucket: /data")
+else:
+    ROOT = os.environ.get("HF_BUCKET_PATH", "")
+    if ROOT.startswith("hf://"):
+        pass
+    elif ROOT and os.path.isdir(ROOT):
+        ROOT = os.path.abspath(ROOT)
+    else:
+        raise RuntimeError(
+            f"HF_BUCKET_PATH 未设置或路径无效，且 /data 未挂载。当前: {ROOT or 'None'}"
+        )
+
+ROOT = ROOT.rstrip("/")
+
+METRICS = ("star", "fork", "issue", "pr")
+
+_RANKING = pd.read_parquet(f"{ROOT}/ranking_top500.parquet")
+_SNAPSHOT = _RANKING["snapshot_date"].max()
+_RANKING = _RANKING[_RANKING["snapshot_date"] == _SNAPSHOT]
+
+
+def _window_label(window_name: str) -> str:
+    if window_name == "d14":
+        return "发表后14天"
+    if window_name.startswith("rolling_"):
+        lm = {"7d": "最近7天", "30d": "最近30天",
+              "3m": "最近3个月", "6m": "最近6个月"}
+        pv = window_name.replace("rolling_", "")
+        return lm.get(pv, f"最近{pv}")
+    if window_name == "year_ytd":
+        return f"{_SNAPSHOT.year}年YTD"
+    if window_name.startswith("year_"):
+        return f"{window_name[5:]}年"
+    if window_name == "total":
+        return "总榜"
+    return window_name
+
+
+def _window_sort_key(window_name: str):
+    fixed = {
+        "d14": (0, ""),
+        "rolling_7d": (1, "1"), "rolling_30d": (1, "2"),
+        "rolling_3m": (1, "3"), "rolling_6m": (1, "4"),
+        "total": (99, ""),
+    }
+    if window_name in fixed:
+        return fixed[window_name]
+    if window_name == "year_ytd":
+        return (2, "")
+    if window_name.startswith("year_"):
+        return (3, "".join(chr(0x9fff - ord(c)) for c in window_name[5:]))
+    return (50, window_name)
+
+
+WINDOW_NAMES = sorted(_RANKING["window_name"].unique(), key=_window_sort_key)
+TIME_OPTIONS = [(_window_label(wn), wn) for wn in WINDOW_NAMES]
+DEFAULT_WINDOW = "d14" if "d14" in WINDOW_NAMES else (WINDOW_NAMES or [""])[0]
+
+_paper_details = None
+_repo_details = None
+_lock = threading.Lock()
+
+
+def ensure_details_loaded():
+    global _paper_details, _repo_details
+    with _lock:
+        if _paper_details is not None:
+            return
+        _paper_details = pd.read_parquet(
+            f"{ROOT}/paper_details_github.parquet"
+        ).set_index("arxiv_id")
+        _repo_details = pd.read_parquet(
+            f"{ROOT}/repo_details.parquet"
+        ).set_index("repo_id")
+
+
+@functools.lru_cache(maxsize=32)
+def load_ranking_wide(window_name: str) -> pd.DataFrame:
+    """从 ranking_top500.parquet 过滤窗口并透视成四指标宽表。"""
+    if not window_name:
+        return pd.DataFrame()
+    df = _RANKING[_RANKING["window_name"] == window_name]
+    if df.empty:
+        return pd.DataFrame(columns=["rank", "arxiv_id", "title",
+                                     "star", "fork", "issue", "pr"])
+    wide = df.pivot_table(
+        index=["arxiv_id", "title"],
+        columns="metric",
+        values="metric_value",
+        aggfunc="max",
+    ).reset_index()
+    for metric in METRICS:
+        if metric not in wide.columns:
+            wide[metric] = None
+    wide = wide[["arxiv_id", "title", *METRICS]]
+    primary = next(
+        (m for m in METRICS if wide[m].notna().any()),
+        METRICS[0],
+    )
+    wide = wide.sort_values(
+        [primary, "arxiv_id"],
+        ascending=[False, True],
+        na_position="last",
+    ).reset_index(drop=True)
+    wide.insert(0, "rank", range(1, len(wide) + 1))
+    return wide
+
+
+def _esc(value) -> str:
+    return html.escape(str(value), quote=True)
+
+
+def _is_missing(value) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if hasattr(value, "ndim") and value.ndim > 0:
+        return len(value) == 0
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def render_paper_detail_html(arxiv_id: str) -> str:
+    """生成论文详情的弹窗内容（纯 HTML，可直接嵌入覆盖层）。"""
+    ensure_details_loaded()
+    if _paper_details is None or arxiv_id not in _paper_details.index:
+        return f"<h2>未找到论文</h2><p>arXiv ID: {_esc(arxiv_id)}</p>"
+    row = _paper_details.loc[arxiv_id]
+    title = "无标题" if _is_missing(row.get("title")) else row["title"]
+    lines = [f"<h2>{_esc(title)}</h2>",
+             f"<p><strong>arXiv ID</strong>: {_esc(arxiv_id)}</p>"]
+    for key, label in [("published_date", "发布时间"), ("authors", "作者"),
+                       ("categories", "分类")]:
+        if not _is_missing(row.get(key)):
+            lines.append(f"<p><strong>{label}</strong>: {_esc(row[key])}</p>")
+    if not _is_missing(row.get("abstract")):
+        lines.append(f"<h3>摘要</h3><p>{_esc(row['abstract'])}</p>")
+    linked = row.get("linked_repos")
+    if not _is_missing(linked):
+        if isinstance(linked, str):
+            try:
+                repos = json.loads(linked)
+            except Exception:
+                repos = []
+        elif hasattr(linked, "tolist"):
+            repos = linked.tolist()
+        else:
+            repos = list(linked) if isinstance(linked, (list, tuple)) else []
+        if isinstance(repos, dict):
+            repos = list(repos.values())
+        lines.append(f"<h3>关联仓库（{len(repos)} 个）</h3><ul>")
+        for r in repos[:20]:
+            if not isinstance(r, dict):
+                continue
+            fn = r.get("full_name", "")
+            lines.append(
+                f"<li><a href=\"https://github.com/{_esc(fn)}\" "
+                f"target=\"_blank\" rel=\"noopener\">{_esc(fn)}</a></li>"
+            )
+        if len(repos) > 20:
+            lines.append(f"<li>还有 {len(repos) - 20} 个</li>")
+        lines.append("</ul>")
+    return "\n".join(lines)
+
+
+def render_openalex(arxiv_id: str) -> str:
+    """渲染论文的 openalex_data；无数据时展示空态。"""
+    ensure_details_loaded()
+    if _paper_details is None or arxiv_id not in _paper_details.index:
+        return "## OpenAlex\n\n暂无数据"
+    row = _paper_details.loc[arxiv_id]
+    data = row.get("openalex_data")
+    if _is_missing(data):
+        return "## OpenAlex\n\n暂无数据"
+    lines = ["## OpenAlex"]
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except Exception:
+            lines.append(str(data))
+            return "\n".join(lines)
+    elif hasattr(data, "tolist"):
+        data = data.tolist()
+    if isinstance(data, dict):
+        for key in ("title", "authors", "concepts", "cited_by_count"):
+            if key not in data:
+                continue
+            value = data[key]
+            if isinstance(value, (list, dict)):
+                value = json.dumps(value, ensure_ascii=False)
+            lines.append(f"- **{key}**: {value}")
+    elif isinstance(data, (list, tuple)):
+        lines.append(json.dumps(data, ensure_ascii=False))
+    return "\n".join(lines)
+
+
+def _detail_modal_html(arxiv_id: str) -> str:
+    body = render_paper_detail_html(arxiv_id)
+    return f"""
+<div id="paper-detail-modal"
+     style="position:fixed;inset:0;z-index:1000;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.45);">
+  <div style="width:min(920px,92vw);max-height:84vh;overflow:auto;background:#fff;border-radius:8px;padding:20px;box-shadow:0 10px 40px rgba(0,0,0,0.35);">
+    <div style="display:flex;justify-content:flex-end;margin-bottom:8px;">
+      <button onclick="this.closest('#paper-detail-modal').remove()">关闭</button>
+    </div>
+    {body}
+  </div>
+</div>
+"""
+
+
+def open_paper_detail(evt: gr.SelectData, df: pd.DataFrame):
+    """点击榜单行：填充详情与 OpenAlex 面板，并打开 HTML 弹窗。"""
+    if df is None or df.empty:
+        return gr.update(visible=False), "## OpenAlex\n\n暂无数据"
+    try:
+        idx = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
+        arxiv_id = df.iloc[idx]["arxiv_id"]
+    except Exception:
+        return gr.update(visible=False), "## OpenAlex\n\n暂无数据"
+    if arxiv_id in ("-", None) or pd.isna(arxiv_id):
+        return gr.update(visible=False), "## OpenAlex\n\n暂无数据"
+    arxiv_id = str(arxiv_id)
+    return (
+        gr.update(value=_detail_modal_html(arxiv_id), visible=True),
+        render_openalex(arxiv_id),
+    )
+
+
+def warmup():
+    threading.Thread(target=ensure_details_loaded, daemon=True).start()
+
+
+with gr.Blocks(title="Arxiv & Github Ranking") as demo:
+    gr.Markdown("# Arxiv & Github Ranking")
+    with gr.Row(equal_height=True):
+        with gr.Column(scale=1, min_width=420):
+            window_sel = gr.Dropdown(choices=TIME_OPTIONS, value=DEFAULT_WINDOW, label="时间窗口")
+            ranking_table = gr.Dataframe(
+                value=load_ranking_wide(DEFAULT_WINDOW),
+                max_height=560,
+                interactive=False, label="Top 500",
+            )
+        with gr.Column(scale=1, min_width=420):
+            openalex_md = gr.Markdown("## OpenAlex\n\n暂无数据")
+
+    detail_modal = gr.HTML(visible=False)
+
+    window_sel.change(load_ranking_wide, inputs=window_sel, outputs=ranking_table)
+    ranking_table.select(
+        open_paper_detail,
+        inputs=ranking_table,
+        outputs=[detail_modal, openalex_md],
+    )
+    demo.load(warmup)
+
+
+if __name__ == "__main__":
+    demo.launch(server_name="0.0.0.0", server_port=7860)

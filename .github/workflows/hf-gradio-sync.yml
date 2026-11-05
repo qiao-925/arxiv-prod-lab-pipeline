@@ -1,0 +1,32 @@
+name: Sync Gradio UI to Hugging Face Space
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'hf_gradio_ui/**'
+      - '.github/workflows/hf-gradio-sync.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: hf-sync-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        # 如果 hf_gradio_ui 中有 >100MB 的文件，取消下一行注释
+        # with:
+        #   lfs: true
+
+      - name: Sync to HF Space
+        uses: huggingface/hub-sync@v0.3.0
+        with:
+          github_repo_id: ${{ github.repository }}
+          huggingface_repo_id: Peter7310/arxiv_gradio
+          hf_token: ${{ secrets.HF_TOKEN }}
+          subdirectory: 'hf_gradio_ui'
+          space_sdk: gradio
+          # repo_type 默认为 space，无需显式指定

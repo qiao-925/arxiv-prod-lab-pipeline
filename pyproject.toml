@@ -5,10 +5,14 @@ description = "arXiv + GitHub 实时热度监测数据平台"
 requires-python = ">=3.14"
 dependencies = [
     "apscheduler>=3.11.3",
+    "boto3>=1.43.110",
+    "huggingface-hub>=2.4.0",
     "infisicalsdk>=1.0.17",
     "kafka-python>=2.0.2",
     "minio>=7.2.20",
+    "pandas>=3.1.1",
     "psycopg2-binary>=2.9.9",
+    "pyarrow>=26.0.1",
     "python-dotenv>=1.2.4",
     "requests>=2.34.2",
     "scheduler>=0.8.11",
