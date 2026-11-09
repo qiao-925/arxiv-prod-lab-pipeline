@@ -35,6 +35,7 @@ import pandas as pd
 from common import config as cfg
 from common.logger import setup_logger
 from common.pg_client import PGClient
+from common.rank_paths import DEFAULT_RANK_OUTPUT_DIR, OPENALEX_RANK_FILES
 
 SQL_FILE = Path(__file__).parent / "rank_sql" / "01_github_arxiv.sql"
 METRICS = ("star", "fork", "issue", "pr")
@@ -405,13 +406,17 @@ def upload_hf(out: Path, log) -> None:
 # 主流程
 # ═══════════════════════════════════════════════════════════════════════
 
-def clean_output_dir(out: Path, log) -> None:
-    """清空本地 parquet 输出目录，避免旧快照残留混入新数据。"""
+def clean_output_dir(out: Path, log, keep_files=()) -> None:
+    """清理旧产物，同时保留另一个排名 Job 的共享文件。"""
     target = out.resolve()
+    keep = set(keep_files)
     if target in (Path("/").resolve(), Path.home().resolve(), Path.cwd().resolve()):
         raise RuntimeError(f"拒绝清理危险目录: {target}")
     if target.exists():
         for item in target.iterdir():
+            if item.is_file() and item.name in keep:
+                log.info(f"[clean] 保留其他任务产物 {item.name}")
+                continue
             if item.is_dir() and not item.is_symlink():
                 shutil.rmtree(item)
             else:
@@ -430,8 +435,10 @@ def run(env: str, log) -> None:
         if snapshot_date is None:
             return
 
-        out = Path(os.getenv("RANK_OUTPUT_DIR", "/tmp/ranking")).resolve()
-        clean_output_dir(out, log)
+        out = Path(
+            os.getenv("RANK_OUTPUT_DIR", DEFAULT_RANK_OUTPUT_DIR)
+        ).resolve()
+        clean_output_dir(out, log, keep_files=OPENALEX_RANK_FILES)
         out.mkdir(parents=True, exist_ok=True)
 
         mark_running(pg, job_name_key, snapshot_date)
