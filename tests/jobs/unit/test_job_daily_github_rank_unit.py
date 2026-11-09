@@ -233,13 +233,19 @@ def test_upload_success_logs_command_and_files(tmp_path, monkeypatch):
 
 def test_clean_output_dir_removes_stale_files(tmp_path):
     (tmp_path / "old.parquet").write_text("stale")
+    (tmp_path / "openalex_ranking_top500.parquet").write_text("keep")
     (tmp_path / "old_dir").mkdir()
     (tmp_path / "old_dir" / "x.parquet").write_text("stale")
 
     log = MagicMock()
-    clean_output_dir(tmp_path, log)
+    clean_output_dir(
+        tmp_path,
+        log,
+        keep_files={"openalex_ranking_top500.parquet"},
+    )
 
     assert not (tmp_path / "old.parquet").exists()
+    assert (tmp_path / "openalex_ranking_top500.parquet").exists()
     assert not (tmp_path / "old_dir").exists()
     info = " ".join(str(c) for c in log.info.call_args_list)
     assert "已清空输出目录" in info
