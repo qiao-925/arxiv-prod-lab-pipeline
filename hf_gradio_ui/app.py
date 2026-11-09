@@ -1,34 +1,11 @@
-# Gradio 本地调试重启：
-# pkill -f 'python hf_gradio_ui/app.py' || true
-# GRADIO_LOCAL_DEBUG=1 .venv/bin/python hf_gradio_ui/app.py
 """Gradio: Arxiv & Github Ranking（读挂载 Parquet / HF Bucket）。
 
 布局：
     - 左侧 50%：时间窗口筛选 + Top 500 表格（Star/Fork/Issue/PR 四列）
-    - 右侧 50%：OpenAlex 引用榜（独立时间窗口 + 累计引用列）
-    - 点击任一榜单行：打开详情弹窗（HTML 覆盖层）
+    - 右侧 50%：OpenAlex 预留面板（当前 openalex_data 为空时展示空态）
+    - 点击榜单行：打开非全屏大弹窗（HTML 覆盖层），展示论文详情和关联仓库
     - 榜单表头可点击排序
-
-数据源：
-    - 优先 /data 挂载目录，回退到 HF_BUCKET_PATH 指定的 hf:// bucket
-      或本地目录
-    - GitHub 数据由 job_daily_github_rank 生成
-    - OpenAlex 数据由 job_openalex_rank 手动生成
-
-容错：
-    OpenAlex 两个 Parquet 尚未发布时，右侧展示空态，不影响 GitHub 榜加载。
-
-本地调试：
-    GRADIO_LOCAL_DEBUG=1 .venv/bin/python hf_gradio_ui/app.py
-
-    默认读取共享目录 /tmp/ranking，可用 GRADIO_LOCAL_DATA_DIR 覆盖。
-
-    本地重启：
-    pkill -f 'python hf_gradio_ui/app.py' || true
-    GRADIO_LOCAL_DEBUG=1 .venv/bin/python hf_gradio_ui/app.py
-
-    如需本地真实数据，再使用：
-    HF_BUCKET_PATH=/absolute/parquet-dir .venv/bin/python hf_gradio_ui/app.py
+数据源：优先 /data 挂载目录，回退到 HF_BUCKET_PATH 指定的 hf:// bucket 或本地目录。
 """
 import functools
 import html
@@ -39,12 +16,6 @@ import threading
 import gradio as gr
 import pandas as pd
 import spaces
-
-
-@spaces.GPU
-def gpu_runtime_check(value: int = 0) -> str:
-    """ZeroGPU 启动检测与运行时可用性检查，返回可序列化字符串。"""
-    return f"GPU runtime ready: {value}"
 
 
 @spaces.GPU
