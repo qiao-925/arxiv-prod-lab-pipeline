@@ -2,9 +2,28 @@
 
 布局：
     - 左侧 50%：时间窗口筛选 + Top 500 表格（Star/Fork/Issue/PR 四列）
+    - 右侧 50%：OpenAlex 引用榜（独立时间窗口 + 累计引用列）
+    - 点击任一榜单行：打开详情弹窗（HTML 覆盖层）
     - 右侧 50%：OpenAlex 预留面板（当前 openalex_data 为空时展示空态）
     - 点击榜单行：打开非全屏大弹窗（HTML 覆盖层），展示论文详情和关联仓库
     - 榜单表头可点击排序
+
+数据源：
+    - 优先 /data 挂载目录，回退到 HF_BUCKET_PATH 指定的 hf:// bucket
+      或本地目录
+    - GitHub 数据由 job_daily_github_rank 生成
+    - OpenAlex 数据由 job_openalex_rank 手动生成
+
+容错：
+    OpenAlex 两个 Parquet 尚未发布时，右侧展示空态，不影响 GitHub 榜加载。
+
+本地调试：
+    默认读取共享目录 /tmp/ranking，可用 GRADIO_LOCAL_DATA_DIR 覆盖。
+
+    本地重启：
+    pkill -f 'python hf_gradio_ui/app.py' || true
+    GRADIO_LOCAL_DEBUG=1 .venv/bin/python hf_gradio_ui/app.py
+
 数据源：优先 /data 挂载目录，回退到 HF_BUCKET_PATH 指定的 hf:// bucket 或本地目录。
 """
 import functools
@@ -347,6 +366,29 @@ def render_openalex_paper_detail_html(arxiv_id: str) -> str:
     return "\n".join(lines)
 
 
+_PAPER_DETAIL_THEME_JS = """
+() => {
+  const colorScheme = window.matchMedia('(prefers-color-scheme: dark)');
+  const applyPaperDetailTheme = () => {
+    document.querySelectorAll('#paper-detail-panel').forEach((panel) => {
+      panel.dataset.theme = colorScheme.matches ? 'dark' : 'light';
+    });
+  };
+
+  if (!window.__paperDetailThemeListenerReady) {
+    window.__paperDetailThemeListenerReady = true;
+    colorScheme.addEventListener('change', applyPaperDetailTheme);
+    new MutationObserver(applyPaperDetailTheme).observe(document.body, {
+      childList: true,
+      subtree: true,
+    });
+  }
+
+  applyPaperDetailTheme();
+}
+"""
+
+
 def _detail_modal_html(arxiv_id: str, source: str = "github") -> str:
     body = (
         render_openalex_paper_detail_html(arxiv_id)
@@ -354,9 +396,29 @@ def _detail_modal_html(arxiv_id: str, source: str = "github") -> str:
         else render_paper_detail_html(arxiv_id)
     )
     return f"""
+<style>
+#paper-detail-panel {{
+  background-color: #fff;
+  color: #111;
+}}
+#paper-detail-panel[data-theme="dark"] {{
+  background-color: #0f0f11;
+  color: #f5f5f5;
+  color-scheme: dark;
+}}
+#paper-detail-panel[data-theme="dark"] a {{
+  color: #8ab4f8;
+}}
+#paper-detail-panel[data-theme="dark"] button {{
+  background-color: #222;
+  border-color: #666;
+  color: #fff;
+}}
+</style>
 <div id="paper-detail-modal"
      style="position:fixed;inset:0;z-index:1000;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.45);">
-  <div style="width:min(920px,92vw);max-height:84vh;overflow:auto;background:#fff;border-radius:8px;padding:20px;box-shadow:0 10px 40px rgba(0,0,0,0.35);">
+  <div id="paper-detail-panel"
+       style="width:min(920px,92vw);max-height:84vh;overflow:auto;border-radius:8px;padding:20px;box-shadow:0 10px 40px rgba(0,0,0,0.35);">
     <div style="display:flex;justify-content:flex-end;margin-bottom:8px;">
       <button onclick="this.closest('#paper-detail-modal').remove()">关闭</button>
     </div>
@@ -454,7 +516,7 @@ with gr.Blocks(title="Arxiv, Github & OpenAlex Ranking") as demo:
         inputs=openalex_ranking_table,
         outputs=detail_modal,
     )
-    demo.load(warmup)
+    demo.load(warmup, js=_PAPER_DETAIL_THEME_JS)
 
 
 if __name__ == "__main__":

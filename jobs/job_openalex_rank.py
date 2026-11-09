@@ -13,6 +13,11 @@
     ENV=test python -m jobs.job_openalex_rank run
     ENV=test python -m jobs.job_openalex_rank verify
 
+    add as_of_date in openalex_rank_task table.
+    then run:
+    ENV=prod python -m jobs.job_openalex_rank run
+
+
 人工流程：
     1. init 幂等创建任务表
     2. OpenAlex 数据更新后，向 openalex_rank_task 插入 as_of_date
