@@ -31,9 +31,6 @@ class _Schema:
     MINIO_ACCESS_KEY: str
     MINIO_SECRET_KEY: str
 
-    KAFKA_BOOTSTRAP: str
-    KAFKA_MAX_REQUEST_SIZE: int
-
     GITHUB_TOKEN:str
     HF_BUCKET_PATH: str
     HF_TOKEN: str
@@ -58,8 +55,6 @@ if typing.TYPE_CHECKING:
     MINIO_ENDPOINT: str
     MINIO_ACCESS_KEY: str
     MINIO_SECRET_KEY: str
-    KAFKA_BOOTSTRAP: str
-    KAFKA_MAX_REQUEST_SIZE: int
     GITHUB_TOKEN: str
     HF_BUCKET_PATH: str
     HF_TOKEN: str
