@@ -108,9 +108,9 @@ else:
 def _window_label(window_name: str, snapshot=None) -> str:
     snapshot = snapshot if snapshot is not None else _SNAPSHOT
     if window_name == "d14":
-        return "发表后14天"
+        return "论文发表后14天"
     if window_name.startswith("rolling_"):
-        lm = {"7d": "最近7天", "30d": "最近30天",
+        lm = {"7d": "最近7天（各维度均以 GitHub 事件更新时间作为时间基准，并据此关联论文。）", "30d": "最近30天",
               "3m": "最近3个月", "6m": "最近6个月"}
         pv = window_name.replace("rolling_", "")
         return lm.get(pv, f"最近{pv}")
